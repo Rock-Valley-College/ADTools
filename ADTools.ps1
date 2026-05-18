@@ -21,13 +21,13 @@
       (Domain Admin or delegated Event Log Reader on DCs)
 
 .NOTES
-    Version:  2.2.1
+    Version:  2.2.6
     GitHub:   https://github.com/Rock-Valley-College/ADTools
     Releases: https://github.com/Rock-Valley-College/ADTools/releases
 #>
 
 # -- VERSION -------------------------------------------------------------------
-$SCRIPT_VERSION = "2.2.1"
+$SCRIPT_VERSION = "2.2.6"
 $REPO_URL      = "https://github.com/Rock-Valley-College/ADTools"
 $RELEASES_URL  = "$REPO_URL/releases"
 
@@ -285,7 +285,7 @@ function Switch-AppTab {
     $pnlLockoutTab.Visible = -not $userOn
     Set-TabNavStyle $btnTabUser $userOn
     Set-TabNavStyle $btnTabLockout (-not $userOn)
-    if ($userOn) { $txtUserSearch.Focus() }
+    if ($userOn) { $txtUserSearch.Focus() } else { $txtLockoutUser.Focus() }
 }
 
 # -- FORM ----------------------------------------------------------------------
@@ -299,26 +299,26 @@ $form.ForeColor       = $C.TextPrimary
 $form.FormBorderStyle = "Sizable"
 $form.Font            = $F.Normal
 
-# Header (title + tab buttons - tabs live here so they cannot be covered by Fill panels)
-$pnlHeader = New-Object System.Windows.Forms.Panel
-$pnlHeader.Dock="Top"; $pnlHeader.Height=96; $pnlHeader.BackColor=$C.Panel
+# Title bar and tab bar are separate Top panels so content never sits under the tabs
+$pnlTitleBar = New-Object System.Windows.Forms.Panel
+$pnlTitleBar.Dock="Top"; $pnlTitleBar.Height=44; $pnlTitleBar.BackColor=$C.Panel
 
 $lblAppTitle = New-Object System.Windows.Forms.Label
 $lblAppTitle.Text="RVC ADTools"; $lblAppTitle.Font=$F.Title
 $lblAppTitle.ForeColor=$C.TextPrimary; $lblAppTitle.AutoSize=$true
 Set-ControlDarkStyle $lblAppTitle $C.Panel
 $lblAppTitle.Location=New-Object System.Drawing.Point(8,10)
-$pnlHeader.Controls.Add($lblAppTitle)
+$pnlTitleBar.Controls.Add($lblAppTitle)
 
 $lblVerBadge = New-Object System.Windows.Forms.Label
 $lblVerBadge.Text="v$SCRIPT_VERSION"; $lblVerBadge.Font=$F.Micro
 $lblVerBadge.ForeColor=$C.TextMuted; $lblVerBadge.AutoSize=$true
 Set-ControlDarkStyle $lblVerBadge $C.Panel
 $lblVerBadge.Anchor="Top,Right"; $lblVerBadge.Location=New-Object System.Drawing.Point(830,14)
-$pnlHeader.Controls.Add($lblVerBadge)
+$pnlTitleBar.Controls.Add($lblVerBadge)
 
 $pnlTabBar = New-Object System.Windows.Forms.Panel
-$pnlTabBar.Dock="Bottom"; $pnlTabBar.Height=48; $pnlTabBar.BackColor=$C.Bg
+$pnlTabBar.Dock="Top"; $pnlTabBar.Height=48; $pnlTabBar.BackColor=$C.Bg
 
 $btnTabUser = New-Object System.Windows.Forms.Button
 $btnTabUser.Text="User"; $btnTabUser.Width=200; $btnTabUser.Height=40
@@ -330,7 +330,16 @@ $btnTabLockout.Dock="Fill"; $btnTabLockout.Cursor="Hand"
 
 $pnlTabBar.Controls.Add($btnTabLockout)
 $pnlTabBar.Controls.Add($btnTabUser)
-$pnlHeader.Controls.Add($pnlTabBar)
+
+# Toolbar rows on the form (below tabs) so Fill panels cannot cover them
+$pnlUserSearch = New-Object System.Windows.Forms.Panel
+$pnlUserSearch.Dock="Top"; $pnlUserSearch.Height=56; $pnlUserSearch.BackColor=$C.Bg
+
+$pnlLkCtrl = New-Object System.Windows.Forms.Panel
+$pnlLkCtrl.Dock="Top"; $pnlLkCtrl.Height=56; $pnlLkCtrl.BackColor=$C.Bg
+
+$pnlLkAct = New-Object System.Windows.Forms.Panel
+$pnlLkAct.Dock="Top"; $pnlLkAct.Height=36; $pnlLkAct.BackColor=$C.Bg
 
 # Status bar
 $pnlStatus = New-Object System.Windows.Forms.Panel
@@ -363,7 +372,10 @@ function Set-Status {
     $lblStatus.Text=$Msg
 }
 
-# -- MAIN (tab content; nav buttons are in the header) --------------------------
+# -- BODY (toolbars + tab pages in one Fill panel so layout stacks correctly) -----
+$pnlBody = New-Object System.Windows.Forms.Panel
+$pnlBody.Dock="Fill"; $pnlBody.BackColor=$C.Bg
+
 $pnlShell = New-Object System.Windows.Forms.Panel
 $pnlShell.Dock="Fill"; $pnlShell.BackColor=$C.Bg
 
@@ -376,26 +388,33 @@ $pnlLockoutTab.Dock="Fill"; $pnlLockoutTab.BackColor=$C.Bg; $pnlLockoutTab.Visib
 $pnlShell.Controls.Add($pnlLockoutTab)
 $pnlShell.Controls.Add($pnlUserTab)
 
+$pnlBody.Controls.Add($pnlShell)
+
 $btnTabUser.Add_Click({ Switch-AppTab -Name User })
 $btnTabLockout.Add_Click({ Switch-AppTab -Name Lockout })
 Set-TabNavStyle $btnTabUser $true
 Set-TabNavStyle $btnTabLockout $false
 
-# Dock order: Top/Bottom first, Fill last
-$form.Controls.Add($pnlHeader)
+$form.Controls.Add($pnlBody)
 $form.Controls.Add($pnlStatus)
-$form.Controls.Add($pnlShell)
+$form.Controls.Add($pnlTitleBar)
+$form.Controls.Add($pnlTabBar)
 
 # ==============================================================================
 # TAB 1 - USER
 # ==============================================================================
 
-$pnlUserSearch = New-Object System.Windows.Forms.Panel
-$pnlUserSearch.Dock="Top"; $pnlUserSearch.Height=50; $pnlUserSearch.BackColor=$C.Bg
+$splitUser = New-Object System.Windows.Forms.SplitContainer
+$splitUser.Dock="Fill"; $splitUser.BackColor=$C.Bg; $splitUser.BorderStyle="None"
+$splitUser.Panel1.AutoScroll=$true; $splitUser.Panel2.AutoScroll=$true
+$splitUser.Panel1.Padding=New-Object System.Windows.Forms.Padding(8,8,4,8)
+$splitUser.Panel2.Padding=New-Object System.Windows.Forms.Padding(4,8,8,8)
 
-$pnlUserContent = New-Object System.Windows.Forms.Panel
-$pnlUserContent.Dock="Fill"; $pnlUserContent.BackColor=$C.Bg
-$pnlUserContent.Padding=New-Object System.Windows.Forms.Padding(12,4,12,4)
+function Update-GroupsListHeight {
+    if (-not $cGrp -or -not $lstGroups) { return }
+    $lstGroups.Width=[Math]::Max(100,$cGrp.ClientSize.Width-24)
+    $lstGroups.Height=[Math]::Max(120,$cGrp.ClientSize.Height-36)
+}
 
 function New-Lbl { param($parent,$text,$font,$color,$x,$y,$autosize=$true)
     $lblCtrl=New-Object System.Windows.Forms.Label; $lblCtrl.Text=$text; $lblCtrl.Font=$font
@@ -418,45 +437,24 @@ function New-Txt { param($parent,$x,$y,$w,$font)
     Set-ControlDarkStyle $t $C.InputBg
     $parent.Controls.Add($t); return $t }
 
-$pnlUserTab.Controls.Add($pnlUserSearch)
-$pnlUserTab.Controls.Add($pnlUserContent)
+# Fill first, then Top (search bar) so the bar never sits under the split view
+$pnlUserTab.Controls.Add($splitUser)
 
-New-Lbl $pnlUserSearch "Username" $F.Heading $C.TextPrimary 12 17 | Out-Null
-$txtUserSearch = New-Txt $pnlUserSearch 98 13 320 $F.Mono
-$btnUserSearch = New-Btn $pnlUserSearch "Look Up" $F.Heading $C.Accent ([System.Drawing.Color]::White) 430 13 86 26
-
-$pnlUL = New-Object System.Windows.Forms.Panel; $pnlUL.BackColor=$C.Bg
-$pnlUR = New-Object System.Windows.Forms.Panel; $pnlUR.BackColor=$C.Bg
-$pnlUserContent.Controls.Add($pnlUL); $pnlUserContent.Controls.Add($pnlUR)
-
-$pnlUserContent.Add_Resize({
-    try {
-        if ($pnlUserContent.ClientSize.Width -lt 80) { return }
-        $contentW=$pnlUserContent.ClientSize.Width-8; $contentH=$pnlUserContent.ClientSize.Height-4
-        $leftW=[int]($contentW*0.46); $rightW=$contentW-$leftW-12
-        if ($rightW -lt 40) { return }
-        $pnlUL.Size=New-Object System.Drawing.Size($leftW,$contentH)
-        $pnlUR.Location=New-Object System.Drawing.Point(($leftW+12),0)
-        $pnlUR.Size=New-Object System.Drawing.Size($rightW,$contentH)
-    } catch { }
-})
-# Trigger initial layout
-$pnlUL.Size=New-Object System.Drawing.Size(390,600); $pnlUL.Location=New-Object System.Drawing.Point(0,0)
-$pnlUR.Size=New-Object System.Drawing.Size(440,600); $pnlUR.Location=New-Object System.Drawing.Point(406,0)
+New-Lbl $pnlUserSearch "Username" $F.Heading $C.TextPrimary 12 18 | Out-Null
+$txtUserSearch = New-Txt $pnlUserSearch 98 14 320 $F.Mono
+$btnUserSearch = New-Btn $pnlUserSearch "Look Up" $F.Heading $C.Accent ([System.Drawing.Color]::White) 430 14 86 28
 
 function New-Card {
-    param([System.Windows.Forms.Panel]$Parent,[string]$Title,[int]$Y,[int]$Height)
+    param([System.Windows.Forms.Control]$Parent,[string]$Title,[int]$Height)
     $card=New-Object System.Windows.Forms.Panel
-    $card.Size=New-Object System.Drawing.Size(($Parent.Width-2),$Height)
-    $card.Location=New-Object System.Drawing.Point(0,$Y)
-    $card.BackColor=$C.Card; $card.Anchor="Top,Left,Right"
+    $card.Height=$Height; $card.Dock="Top"; $card.BackColor=$C.Card
     $Parent.Controls.Add($card)
     if($Title){ New-Lbl $card $Title.ToUpper() $F.Micro $C.TextMuted 14 10 | Out-Null }
     return $card
 }
 
-# Identity
-$cId = New-Card $pnlUL "Identity" 0 155
+# Identity (Dock Top: add top-to-bottom in order)
+$cId = New-Card $splitUser.Panel1 "Identity" 155
 $lblDN   = New-Lbl $cId "-" (New-Object System.Drawing.Font("Segoe UI",15,[System.Drawing.FontStyle]::Bold)) $C.TextPrimary 14 28
 $lblDN.Size=New-Object System.Drawing.Size(360,30)
 $lblUN2  = New-Lbl $cId "-" $F.MonoSm $C.Accent 14 62
@@ -466,7 +464,7 @@ $lblStat = New-Lbl $cId "" $F.Heading $C.TextMuted 14 124
 $lblLock = New-Lbl $cId "" $F.Heading $C.Danger 120 124
 
 # Details
-$cDet = New-Card $pnlUL "Account Details" 163 215
+$cDet = New-Card $splitUser.Panel1 "Account Details" 215
 function New-DR { param($card,$lbl,$y)
     New-Lbl $card $lbl $F.Small $C.TextMuted 14 $y | Out-Null
     $v=New-Lbl $card "-" $F.Small $C.TextPrimary 158 $y; $v.Size=New-Object System.Drawing.Size(220,16); return $v }
@@ -479,7 +477,7 @@ $vCantChg = New-DR $cDet "Cannot Change Pwd"  138
 $vOU      = New-DR $cDet "OU"                 160
 
 # Password reset
-$cPwd = New-Card $pnlUL "Password Reset" 386 150
+$cPwd = New-Card $splitUser.Panel1 "Password Reset" 150
 New-Lbl $cPwd "Temporary Password" $F.Heading $C.TextPrimary 14 28 | Out-Null
 $txtPwd    = New-Txt   $cPwd 14 48 212 $F.Mono
 $btnGenPwd = New-Btn   $cPwd "New" $F.Small $C.Bg $C.TextPrimary 234 48 56 24 $false
@@ -494,16 +492,19 @@ $cPwd.Controls.Add($chkShow)
 $btnRstPwd = New-Btn   $cPwd "Reset Password" $F.Heading $C.Accent ([System.Drawing.Color]::White) 14 106 344 32 $false
 
 # Right - Groups
-$cGrp = New-Card $pnlUR "Group Memberships" 0 395
+$cGrp = New-Card $splitUser.Panel2 "Group Memberships" 395
 $lstGroups = New-Object System.Windows.Forms.ListBox
-$lstGroups.Dock="None"; $lstGroups.Size=New-Object System.Drawing.Size(410,358)
 $lstGroups.Location=New-Object System.Drawing.Point(12,27)
+$lstGroups.Size=New-Object System.Drawing.Size(360,358)
 $lstGroups.BackColor=$C.InputBg; $lstGroups.ForeColor=$C.TextPrimary
-$lstGroups.BorderStyle="None"; $lstGroups.Font=$F.MonoSm; $lstGroups.Anchor="Top,Left,Right,Bottom"
+$lstGroups.BorderStyle="None"; $lstGroups.Font=$F.MonoSm
+$lstGroups.Anchor="Top,Left,Right,Bottom"
 $cGrp.Controls.Add($lstGroups)
+$cGrp.Add_Resize({ Update-GroupsListHeight })
+$splitUser.Add_SplitterMoved({ Update-GroupsListHeight })
 
 # Right - Actions
-$cAct = New-Card $pnlUR "Actions" 403 84
+$cAct = New-Card $splitUser.Panel2 "Actions" 84
 $btnUnlock  = New-Btn $cAct "Unlock Account"    $F.Heading $C.Bg $C.TextPrimary  14  30 180 34 $false
 $btnUnlock.FlatAppearance.BorderColor=$C.Warning; $btnUnlock.FlatAppearance.BorderSize=1
 $btnRefresh = New-Btn $cAct "Refresh"             $F.Heading $C.Bg $C.TextPrimary 206 30 110 34 $false
@@ -511,6 +512,8 @@ $btnRefresh.FlatAppearance.BorderColor=$C.Border; $btnRefresh.FlatAppearance.Bor
 $btnDiag    = New-Btn $cAct "Diagnose Lockout"   $F.Heading $C.Bg $C.TextPrimary   330 30 180 34 $false
 $btnDiag.FlatAppearance.BorderColor=$C.Danger; $btnDiag.FlatAppearance.BorderSize=1
 $btnDiag.Visible=$false
+
+$pnlUserTab.Controls.Add($pnlUserSearch)
 
 # -- USER TAB LOGIC ------------------------------------------------------------
 $script:CurUser=$null; $script:CurGroups=@()
@@ -627,20 +630,10 @@ $btnDiag.Add_Click({
 # TAB 2 - LOCKOUT DIAGNOSTICS
 # ==============================================================================
 
-$pnlLkCtrl = New-Object System.Windows.Forms.Panel
-$pnlLkCtrl.Dock="Top"; $pnlLkCtrl.Height=54; $pnlLkCtrl.BackColor=$C.Bg
-
-$pnlLkAct = New-Object System.Windows.Forms.Panel
-$pnlLkAct.Dock="Top"; $pnlLkAct.Height=34; $pnlLkAct.BackColor=$C.Bg
-
 $rtbLog = New-Object System.Windows.Forms.RichTextBox
 $rtbLog.Dock="Fill"; $rtbLog.BackColor=$C.InputBg; $rtbLog.ForeColor=$C.LogNormal
 $rtbLog.BorderStyle="None"; $rtbLog.Font=$F.MonoLog; $rtbLog.ReadOnly=$true
 $rtbLog.WordWrap=$false; $rtbLog.ScrollBars="Both"
-
-$pnlLockoutTab.Controls.Add($pnlLkCtrl)
-$pnlLockoutTab.Controls.Add($pnlLkAct)
-$pnlLockoutTab.Controls.Add($rtbLog)
 
 New-Lbl $pnlLkCtrl "Username" $F.Heading $C.TextPrimary 12 18 | Out-Null
 $txtLockoutUser = New-Txt $pnlLkCtrl 98 15 200 $F.Mono
@@ -801,8 +794,18 @@ $btnExport.Add_Click({
     }
 })
 
+# Fill first, then Top toolbars (same pattern as User tab)
+$pnlLockoutTab.Controls.Add($rtbLog)
+$pnlLockoutTab.Controls.Add($pnlLkAct)
+$pnlLockoutTab.Controls.Add($pnlLkCtrl)
+
 $form.Add_Shown({
     try {
+        $form.PerformLayout()
+        if ($splitUser.Width -gt 100) {
+            $splitUser.SplitterDistance=[int]($splitUser.Width*0.46)
+        }
+        Update-GroupsListHeight
         $txtUserSearch.Focus()
         $ad = Ensure-ADModule
         if (-not $ad.Ready) {
