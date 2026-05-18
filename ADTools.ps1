@@ -21,13 +21,13 @@
       (Domain Admin or delegated Event Log Reader on DCs)
 
 .NOTES
-    Version:  2.2.7
+    Version:  2.2.8
     GitHub:   https://github.com/Rock-Valley-College/ADTools
     Releases: https://github.com/Rock-Valley-College/ADTools/releases
 #>
 
 # -- VERSION -------------------------------------------------------------------
-$SCRIPT_VERSION = "2.2.7"
+$SCRIPT_VERSION = "2.2.8"
 $REPO_URL      = "https://github.com/Rock-Valley-College/ADTools"
 $RELEASES_URL  = "$REPO_URL/releases"
 
@@ -103,6 +103,8 @@ Add-Type -AssemblyName System.Drawing -ErrorAction Stop
 $script:ADModuleReady = $false
 $script:ADSessionConnected = $false
 $script:CachedPasswordPolicy = $null
+$script:CachedDomainInfo = $null
+$script:CachedDomainControllers = $null
 
 function Ensure-ADModule {
     if ($script:ADModuleReady -and (Get-Module -Name ActiveDirectory)) {
@@ -138,11 +140,7 @@ function Test-ADConnectivity {
     $ad = Ensure-ADModule
     if (-not $ad.Ready) { return $ad }
     try {
-        Write-TerminalLog 'Get-ADDomain' 'cmd'
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        Get-ADDomain -ErrorAction Stop | Out-Null
-        $sw.Stop()
-        Write-TerminalLog ("finished in {0:N0} ms" -f $sw.ElapsedMilliseconds) 'ok'
+        $script:CachedDomainInfo = Invoke-LoggedAd { Get-ADDomain -ErrorAction Stop } -CommandLabel 'Get-ADDomain'
         $script:ADSessionConnected = $true
         return @{ Ready=$true; Error='' }
     } catch {
@@ -196,6 +194,30 @@ function Invoke-LoggedAd {
     }
 }
 
+function Invoke-LoggedWinEvent {
+    param(
+        [scriptblock]$ScriptBlock,
+        [string]$CommandLabel
+    )
+    Write-TerminalLog $CommandLabel 'cmd'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $out = & $ScriptBlock
+        $sw.Stop()
+        $count = @($out).Count
+        Write-TerminalLog ("finished in {0:N0} ms ({1} event(s))" -f $sw.ElapsedMilliseconds, $count) 'ok'
+        return $out
+    } catch {
+        $sw.Stop()
+        if ($_.Exception.Message -match 'No events were found|No matching events') {
+            Write-TerminalLog ("no events ({0:N0} ms)" -f $sw.ElapsedMilliseconds) 'info'
+            return @()
+        }
+        Write-TerminalLog ("failed after {0:N0} ms: {1}" -f $sw.ElapsedMilliseconds, $_.Exception.Message) 'err'
+        throw
+    }
+}
+
 function Get-GroupNamesFromMemberOf {
     param([AllowNull()][object]$MemberOf)
     if ($null -eq $MemberOf) { return @() }
@@ -220,6 +242,188 @@ function Get-DomainPasswordPolicyCached {
         Get-ADDefaultDomainPasswordPolicy -ErrorAction Stop
     } -CommandLabel 'Get-ADDefaultDomainPasswordPolicy'
     return $script:CachedPasswordPolicy
+}
+
+function Get-DomainInfoCached {
+    if ($script:CachedDomainInfo) { return $script:CachedDomainInfo }
+    $ad = Test-ADConnectivity
+    if (-not $ad.Ready) { throw $ad.Error }
+    return $script:CachedDomainInfo
+}
+
+function Get-DomainControllersCached {
+    if ($script:CachedDomainControllers) { return $script:CachedDomainControllers }
+    $script:CachedDomainControllers = @(
+        Invoke-LoggedAd {
+            Get-ADDomainController -Filter * -ErrorAction Stop | ForEach-Object { $_.HostName }
+        } -CommandLabel 'Get-ADDomainController -Filter *'
+    )
+    return $script:CachedDomainControllers
+}
+
+function Invoke-LockoutDiagnostics {
+    param(
+        [Parameter(Mandatory)][string]$SamAccountName,
+        [int]$HoursBack = 24
+    )
+    $out = New-Object System.Collections.Generic.List[object]
+    $res = New-Object System.Collections.Generic.List[object]
+    function Add-LogLine {
+        param([string]$Text, [string]$Type = 'normal')
+        [void]$out.Add([pscustomobject]@{ Text = $Text; Type = $Type })
+    }
+
+    $since = (Get-Date).AddHours(-$HoursBack)
+    $iso = $since.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+
+    try {
+        $domain = Get-DomainInfoCached
+        $pdc = $domain.PDCEmulator
+    } catch {
+        Add-LogLine "ERROR: Could not get domain info: $_" 'error'
+        return @{ O = $out; R = $res }
+    }
+
+    try {
+        $dcs = Get-DomainControllersCached
+    } catch {
+        Add-LogLine "ERROR: Could not enumerate DCs: $_" 'error'
+        return @{ O = $out; R = $res }
+    }
+
+    Add-LogLine 'RVC ADTools - Lockout Diagnostics' 'heading'
+    Add-LogLine "Started:    $(Get-Date -Format 'MM/dd/yyyy h:mm tt')" 'muted'
+    Add-LogLine "Hours back: $HoursBack" 'muted'
+    Add-LogLine "PDC:        $pdc" 'label'
+    Add-LogLine "DCs ($($dcs.Count)): $($dcs -join ', ')" 'label'
+    Add-LogLine '' 'muted'
+
+    $u = $SamAccountName
+    Add-LogLine '' 'normal'
+    Add-LogLine ('=' * 72) 'heading'
+    Add-LogLine "  USER: $u" 'heading'
+    Add-LogLine ('=' * 72) 'heading'
+
+    Add-LogLine '' 'normal'
+    Add-LogLine '[ Per-DC State ]' 'label'
+    $dcState = @()
+    foreach ($dc in $dcs) {
+        try {
+            $a = Invoke-LoggedAd {
+                Get-ADUser -Identity $u -Server $dc -Properties LockedOut, badPwdCount, LastBadPasswordAttempt, AccountLockoutTime -ErrorAction Stop
+            } -CommandLabel "Get-ADUser -Identity '$u' -Server $dc -Properties LockedOut,badPwdCount,..."
+            $dcState += [pscustomobject]@{
+                DC       = $dc
+                LockedOut = $a.LockedOut
+                BadPwd   = $a.badPwdCount
+                LastBad  = $a.LastBadPasswordAttempt
+                LockTime = $a.AccountLockoutTime
+            }
+            $ls = if ($a.LockedOut) { 'LOCKED' } else { 'OK     ' }
+            $lc = if ($a.LockedOut) { 'error' } else { 'success' }
+            $lastBad = if ($a.LastBadPasswordAttempt) { $a.LastBadPasswordAttempt.ToString('MM/dd HH:mm:ss') } else { 'never' }
+            Add-LogLine ("  {0,-42} {1}   BadPwd:{2,3}   LastBad: {3}" -f $dc, $ls, $a.badPwdCount, $lastBad) $lc
+        } catch {
+            Add-LogLine "  WARNING: Could not query $dc - $_" 'warn'
+        }
+    }
+
+    $orig = $dcState | Where-Object { $_.LockTime } | Sort-Object LockTime -Descending | Select-Object -First 1
+    Add-LogLine '' 'normal'
+    if ($orig) {
+        Add-LogLine "  > Originating DC: $($orig.DC)  (lockout at $($orig.LockTime))" 'warn'
+    } else {
+        Add-LogLine '  > No LockoutTime on any DC - may not be currently locked.' 'muted'
+    }
+
+    Add-LogLine '' 'normal'
+    Add-LogLine "[ Event 4740 - Account Locked Out - PDC: $pdc ]" 'label'
+    $x40 = "*[System[EventID=4740 and TimeCreated[@SystemTime>='$iso']] and EventData[Data[@Name='TargetUserName']='$u']]"
+    try {
+        $e40 = Invoke-LoggedWinEvent {
+            Get-WinEvent -ComputerName $pdc -LogName Security -FilterXPath $x40 -ErrorAction Stop
+        } -CommandLabel "Get-WinEvent -ComputerName $pdc -LogName Security -FilterXPath (EventID=4740, user=$u)"
+    } catch {
+        $e40 = @()
+        Add-LogLine "  WARNING: $($_)" 'warn'
+    }
+    if ($e40) {
+        foreach ($e in $e40) {
+            $caller = $e.Properties[1].Value
+            Add-LogLine ("  {0}   Caller: {1}" -f $e.TimeCreated.ToString('MM/dd/yyyy HH:mm:ss'), $caller) 'warn'
+            [void]$res.Add([pscustomobject]@{
+                User           = $u
+                EventTime      = $e.TimeCreated
+                EventId        = 4740
+                EventType      = 'AccountLocked'
+                CallerComputer = $caller
+                CallerIP       = $null
+                LogonProcess   = $null
+                FailureReason  = $null
+                SourceDC       = $pdc
+            })
+        }
+    } else {
+        Add-LogLine "  No 4740 events in last $HoursBack hour(s)." 'muted'
+    }
+
+    $srcs = @($pdc)
+    if ($orig -and $orig.DC -ne $pdc) { $srcs += $orig.DC }
+    foreach ($src in $srcs) {
+        Add-LogLine '' 'normal'
+        Add-LogLine "[ Event 4625 - Failed Logon - $src ]" 'label'
+        $x25 = "*[System[EventID=4625 and TimeCreated[@SystemTime>='$iso']] and EventData[Data[@Name='TargetUserName']='$u']]"
+        try {
+            $e25 = Invoke-LoggedWinEvent {
+                Get-WinEvent -ComputerName $src -LogName Security -FilterXPath $x25 -ErrorAction Stop
+            } -CommandLabel "Get-WinEvent -ComputerName $src -LogName Security -FilterXPath (EventID=4625, user=$u)"
+        } catch {
+            $e25 = @()
+            Add-LogLine "  WARNING: $($_)" 'warn'
+        }
+        if (-not $e25) {
+            Add-LogLine "  No 4625 events in last $HoursBack hour(s)." 'muted'
+            continue
+        }
+        $grp = $e25 | ForEach-Object {
+            [pscustomobject]@{
+                Time = $_.TimeCreated
+                CC   = $_.Properties[13].Value
+                IP   = $_.Properties[19].Value
+                LP   = $_.Properties[10].Value
+                FR   = $_.Properties[8].Value
+            }
+        }
+        $grp | Group-Object CC, IP, LP | Sort-Object Count -Descending | ForEach-Object {
+            $f = $_.Group[0]
+            Add-LogLine ("  {0,4} attempts   Computer: {1,-24} IP: {2,-16} Process: {3}" -f $_.Count, $f.CC, $f.IP, $f.LP) 'warn'
+        }
+        foreach ($g in $grp) {
+            [void]$res.Add([pscustomobject]@{
+                User           = $u
+                EventTime      = $g.Time
+                EventId        = 4625
+                EventType      = 'FailedLogon'
+                CallerComputer = $g.CC
+                CallerIP       = $g.IP
+                LogonProcess   = $g.LP
+                FailureReason  = $g.FR
+                SourceDC       = $src
+            })
+        }
+    }
+
+    Add-LogLine '' 'normal'
+    Add-LogLine ('-' * 72) 'muted'
+    Add-LogLine "Complete - $($res.Count) event(s) collected." 'success'
+    Add-LogLine '' 'normal'
+    Add-LogLine 'Hints:' 'label'
+    Add-LogLine '  CallerComputer - the machine submitting bad credentials.' 'muted'
+    Add-LogLine '  Advapi process  - likely a service or scheduled task.' 'muted'
+    Add-LogLine '  NtLmSsp/Kerberos - interactive or network logon.' 'muted'
+    Add-LogLine '  Substatus 0xC000006A=wrong pwd  0xC0000064=bad username  0xC0000234=already locked' 'muted'
+
+    return @{ O = $out; R = $res }
 }
 
 # -- HELPERS -------------------------------------------------------------------
@@ -790,107 +994,38 @@ $btnRunDiag.Add_Click({
         Write-Log $ad.Error "error"
         return
     }
-    $btnRunDiag.Enabled=$false; Set-Status "Running lockout diagnostics for $sam..." "info"
     $hrs=[int]$numHours.Value
+    $btnRunDiag.Enabled=$false
+    Set-Status "Running lockout diagnostics for $sam..." "info"
+    Write-TerminalLog "----- Lockout diagnostics: $sam ($hrs hours) -----" 'info'
 
-    $job=Start-Job -ScriptBlock {
-        param($sam,$hrs)
-        $Env:ADPS_LoadDefaultDrive = '0'
-        Import-Module ActiveDirectory -EA Stop
-        $out=New-Object System.Collections.Generic.List[object]
-        $res=New-Object System.Collections.Generic.List[object]
-        $since=(Get-Date).AddHours(-$hrs)
-        function L{param($t,$c="normal"); $out.Add([pscustomobject]@{Text=$t;Type=$c})}
-
-        try{$pdc=(Get-ADDomain).PDCEmulator}catch{L "ERROR: Could not get PDC: $_" "error";return @{O=$out;R=$res}}
-        try{$dcs=(Get-ADDomainController -Filter *).HostName}catch{L "ERROR: Could not enumerate DCs: $_" "error";return @{O=$out;R=$res}}
-
-        L "RVC ADTools - Lockout Diagnostics" "heading"
-        L "Started:    $(Get-Date -Format 'MM/dd/yyyy h:mm tt')" "muted"
-        L "Hours back: $hrs" "muted"
-        L "PDC:        $pdc" "label"
-        L "DCs ($($dcs.Count)): $($dcs -join ', ')" "label"
-        L "" "muted"
-
-        $samList=@($sam)
-        $iso=$since.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-
-        foreach($u in $samList){
-            L "" "normal"; L ("="*72) "heading"; L "  USER: $u" "heading"; L ("="*72) "heading"
-
-            # Per-DC state
-            L "" "normal"; L "[ Per-DC State ]" "label"
-            $dcState=@()
-            foreach($dc in $dcs){
-                try{
-                    $a=Get-ADUser -Identity $u -Server $dc -Properties LockedOut,badPwdCount,LastBadPasswordAttempt,AccountLockoutTime -EA Stop
-                    $dcState+=[pscustomobject]@{DC=$dc;LockedOut=$a.LockedOut;BadPwd=$a.badPwdCount;LastBad=$a.LastBadPasswordAttempt;LockTime=$a.AccountLockoutTime}
-                    $ls=if($a.LockedOut){"LOCKED"}else{"OK     "}
-                    $lc=if($a.LockedOut){"error"}else{"success"}
-                    L ("  {0,-42} {1}   BadPwd:{2,3}   LastBad: {3}" -f $dc,$ls,$a.badPwdCount,$(if($a.LastBadPasswordAttempt){$a.LastBadPasswordAttempt.ToString("MM/dd HH:mm:ss")}else{"never"})) $lc
-                }catch{ L "  WARNING: Could not query $dc - $_" "warn" }
-            }
-            $orig=$dcState|Where-Object{$_.LockTime}|Sort-Object LockTime -Desc|Select-Object -First 1
-            L "" "normal"
-            if($orig){L "  > Originating DC: $($orig.DC)  (lockout at $($orig.LockTime))" "warn"}
-            else     {L "  > No LockoutTime on any DC - may not be currently locked." "muted"}
-
-            # 4740
-            L "" "normal"; L "[ Event 4740 - Account Locked Out - PDC: $pdc ]" "label"
-            $x40="*[System[EventID=4740 and TimeCreated[@SystemTime>='$iso']] and EventData[Data[@Name='TargetUserName']='$u']]"
-            try{$e40=Get-WinEvent -ComputerName $pdc -LogName Security -FilterXPath $x40 -EA Stop}
-            catch{$e40=@(); if($_.Exception.Message -notmatch 'No events'){L "  WARNING: $($_)" "warn"}}
-            if($e40){
-                foreach($e in $e40){
-                    $caller=$e.Properties[1].Value
-                    L ("  {0}   Caller: {1}" -f $e.TimeCreated.ToString("MM/dd/yyyy HH:mm:ss"),$caller) "warn"
-                    $res.Add([pscustomobject]@{User=$u;EventTime=$e.TimeCreated;EventId=4740;EventType='AccountLocked';CallerComputer=$caller;CallerIP=$null;LogonProcess=$null;FailureReason=$null;SourceDC=$pdc})
-                }
-            } else { L "  No 4740 events in last $hrs hour(s)." "muted" }
-
-            # 4625
-            $srcs=@($pdc); if($orig -and $orig.DC -ne $pdc){$srcs+=$orig.DC}
-            foreach($src in $srcs){
-                L "" "normal"; L "[ Event 4625 - Failed Logon - $src ]" "label"
-                $x25="*[System[EventID=4625 and TimeCreated[@SystemTime>='$iso']] and EventData[Data[@Name='TargetUserName']='$u']]"
-                try{$e25=Get-WinEvent -ComputerName $src -LogName Security -FilterXPath $x25 -EA Stop}
-                catch{$e25=@(); if($_.Exception.Message -notmatch 'No events'){L "  WARNING: $($_)" "warn"}}
-                if(-not $e25){L "  No 4625 events in last $hrs hour(s)." "muted";continue}
-                $grp=$e25|ForEach-Object{[pscustomobject]@{Time=$_.TimeCreated;CC=$_.Properties[13].Value;IP=$_.Properties[19].Value;LP=$_.Properties[10].Value;FR=$_.Properties[8].Value}}
-                $grp|Group-Object CC,IP,LP|Sort-Object Count -Desc|ForEach-Object{
-                    $f=$_.Group[0]
-                    L ("  {0,4} attempts   Computer: {1,-24} IP: {2,-16} Process: {3}" -f $_.Count,$f.CC,$f.IP,$f.LP) "warn"
-                }
-                foreach($g in $grp){
-                    $res.Add([pscustomobject]@{User=$u;EventTime=$g.Time;EventId=4625;EventType='FailedLogon';CallerComputer=$g.CC;CallerIP=$g.IP;LogonProcess=$g.LP;FailureReason=$g.FR;SourceDC=$src})
-                }
-            }
-        }
-
-        L "" "normal"; L ("-"*72) "muted"
-        L "Complete - $($res.Count) event(s) collected." "success"
-        L "" "normal"; L "Hints:" "label"
-        L "  CallerComputer - the machine submitting bad credentials." "muted"
-        L "  Advapi process  - likely a service or scheduled task." "muted"
-        L "  NtLmSsp/Kerberos - interactive or network logon." "muted"
-        L "  Substatus 0xC000006A=wrong pwd  0xC0000064=bad username  0xC0000234=already locked" "muted"
-        return @{O=$out;R=$res}
-    } -ArgumentList $sam,$hrs
-
-    $pt=New-Object System.Windows.Forms.Timer; $pt.Interval=500
-    $pt.Add_Tick({
-        if($job.State -in @("Completed","Failed","Stopped")){
-            $pt.Stop()
-            $d=Receive-Job $job -EA SilentlyContinue
-            Remove-Job $job -EA SilentlyContinue
-            if($d -and $d.O){ foreach($logLine in $d.O){ Write-Log $logLine.Text $logLine.Type } }
-            if($d -and $d.R){ foreach($r in $d.R){ $script:DiagResults.Add($r) } }
-            if($script:DiagResults.Count -gt 0){ $btnExport.Enabled=$true }
-            $btnRunDiag.Enabled=$true
-            Set-Status "Diagnostics complete - $($script:DiagResults.Count) event(s) collected." "success"
-        }
+    $worker = New-Object System.ComponentModel.BackgroundWorker
+    $worker.Add_DoWork({
+        param($sender, $e)
+        $e.Result = Invoke-LockoutDiagnostics -SamAccountName $e.Argument.Sam -HoursBack $e.Argument.Hrs
     })
-    $pt.Start()
+    $worker.Add_RunWorkerCompleted({
+        param($sender, $e)
+        $btnRunDiag.Enabled = $true
+        if ($e.Error) {
+            $msg = $e.Error.Message
+            Set-Status "Diagnostics failed: $msg" "error"
+            Write-Log $msg "error"
+            Write-TerminalLog "Diagnostics failed: $msg" 'err'
+            return
+        }
+        $d = $e.Result
+        if ($d -and $d.O) {
+            foreach ($logLine in $d.O) { Write-Log $logLine.Text $logLine.Type }
+        }
+        if ($d -and $d.R) {
+            foreach ($r in $d.R) { $script:DiagResults.Add($r) }
+        }
+        if ($script:DiagResults.Count -gt 0) { $btnExport.Enabled = $true }
+        Set-Status "Diagnostics complete - $($script:DiagResults.Count) event(s) collected." "success"
+        Write-TerminalLog "Diagnostics complete - $($script:DiagResults.Count) event(s) collected." 'ok'
+    })
+    $worker.RunWorkerAsync([pscustomobject]@{ Sam = $sam; Hrs = $hrs })
 })
 
 $btnClrLog.Add_Click({ $rtbLog.Clear(); $script:DiagResults.Clear(); $btnExport.Enabled=$false; Set-Status "Log cleared." "info" })
