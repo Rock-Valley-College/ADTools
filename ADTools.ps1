@@ -21,13 +21,13 @@
       (Domain Admin or delegated Event Log Reader on DCs)
 
 .NOTES
-    Version:  2.2.11
+    Version:  2.2.12
     GitHub:   https://github.com/Rock-Valley-College/ADTools
     Releases: https://github.com/Rock-Valley-College/ADTools/releases
 #>
 
 # -- VERSION -------------------------------------------------------------------
-$SCRIPT_VERSION = "2.2.11"
+$SCRIPT_VERSION = "2.2.12"
 $REPO_URL      = "https://github.com/Rock-Valley-College/ADTools"
 $RELEASES_URL  = "$REPO_URL/releases"
 
@@ -543,6 +543,39 @@ function Get-AdObjectLdapPath {
     return "LDAP://$DistinguishedName"
 }
 
+function Get-AdUserObjectSecurity {
+    param([Parameter(Mandatory)][string]$DistinguishedName)
+    $ldapPath = Get-AdObjectLdapPath -DistinguishedName $DistinguishedName
+    $entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath)
+    return $entry.ObjectSecurity
+}
+
+function Get-SelfChangePasswordAceSummary {
+    param([System.DirectoryServices.ActiveDirectorySecurity]$Acl)
+    $changePwdGuid = [Guid]'ab721a53-1e2f-11d0-9819-00aa0040529b'
+    $selfSid = 'S-1-5-10'
+    $summary = @{
+        ExplicitAllow  = $false
+        InheritedAllow = $false
+        ExplicitDeny   = $false
+        InheritedDeny  = $false
+    }
+    foreach ($ace in $Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+        if ($ace -isnot [System.DirectoryServices.ActiveDirectoryAccessRule]) { continue }
+        if ($ace.ObjectType -ne $changePwdGuid) { continue }
+        try {
+            $sid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
+            if ($sid.Value -ne $selfSid) { continue }
+        } catch { continue }
+        if ($ace.AccessControlType -eq 'Deny') {
+            if ($ace.IsInherited) { $summary.InheritedDeny = $true } else { $summary.ExplicitDeny = $true }
+        } elseif ($ace.AccessControlType -eq 'Allow') {
+            if ($ace.IsInherited) { $summary.InheritedAllow = $true } else { $summary.ExplicitAllow = $true }
+        }
+    }
+    return $summary
+}
+
 function Get-UserPasswordChangeStatus {
     param($User)
     $status = @{
@@ -561,27 +594,21 @@ function Get-UserPasswordChangeStatus {
     }
 
     try {
-        $changePwdGuid = [Guid]'ab721a53-1e2f-11d0-9819-00aa0040529b'
-        $ldapPath = Get-AdObjectLdapPath -DistinguishedName $User.DistinguishedName
+        $sam = $User.SamAccountName
         $acl = Invoke-LoggedAd {
-            Get-Acl -Path $ldapPath -ErrorAction Stop
-        } -CommandLabel "Get-Acl -Path 'LDAP://.../$($User.SamAccountName)' (SELF Change Password)"
-        $selfSid = 'S-1-5-10'
-        $selfAces = foreach ($ace in $acl.Access) {
-            if ($ace.ObjectType -ne $changePwdGuid) { continue }
-            try {
-                $sid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
-                if ($sid.Value -eq $selfSid) { $ace }
-            } catch { }
-        }
-        if (-not $selfAces) {
-            $status.SelfChangePassword = 'NotListed'
-            [void]$status.Issues.Add('No explicit SELF "Change Password" permission on this account (Security > Advanced > SELF). If change fails with Access Denied, set SELF > Change Password to Allow.')
-        } elseif ($selfAces | Where-Object { $_.AccessControlType -eq 'Deny' }) {
+            Get-AdUserObjectSecurity -DistinguishedName $User.DistinguishedName
+        } -CommandLabel "DirectoryEntry.ObjectSecurity ($sam) - SELF Change Password"
+        $self = Get-SelfChangePasswordAceSummary -Acl $acl
+        if ($self.ExplicitDeny -or $self.InheritedDeny) {
             $status.SelfChangePassword = 'Deny'
-            [void]$status.Issues.Add('SELF "Change Password" is explicitly DENIED on this account.')
+            [void]$status.Issues.Add('SELF "Change password" is denied on this account (Security tab > SELF).')
+        } elseif ($self.ExplicitAllow) {
+            $status.SelfChangePassword = 'AllowExplicit'
+        } elseif ($self.InheritedAllow) {
+            $status.SelfChangePassword = 'AllowInherited'
         } else {
-            $status.SelfChangePassword = 'Allow'
+            $status.SelfChangePassword = 'NotAllowed'
+            [void]$status.Issues.Add('SELF does not have "Change password" allowed (Security tab > SELF > Allow Change password).')
         }
     } catch {
         $status.SelfChangePassword = 'Error'
@@ -589,7 +616,7 @@ function Get-UserPasswordChangeStatus {
     }
 
     $status.CanChangeOwnPassword = (-not $status.CannotChangePassword) -and
-        ($status.SelfChangePassword -ne 'Deny')
+        ($status.SelfChangePassword -in @('AllowExplicit', 'AllowInherited'))
     return $status
 }
 
@@ -958,17 +985,18 @@ function Show-UData {
         $vMustChg.Text = if ($PasswordStatus.MustChangeAtLogon) { 'Yes' } else { 'No (may skip prompt)' }
         $vMustChg.ForeColor = if ($PasswordStatus.MustChangeAtLogon) { $C.Success } else { $C.Warning }
         $vSelfChg.Text = switch ($PasswordStatus.SelfChangePassword) {
-            'Allow'     { 'Allow (explicit)' }
-            'Deny'      { 'DENIED' }
-            'NotListed' { 'Not listed (check AD)' }
-            'Error'     { 'Could not read' }
-            default     { '-' }
+            'AllowExplicit'  { 'Allow (explicit)' }
+            'AllowInherited' { 'Allow (inherited)' }
+            'Deny'           { 'DENIED' }
+            'NotAllowed'     { 'Not allowed' }
+            'Error'          { 'Could not read' }
+            default          { '-' }
         }
         $vSelfChg.ForeColor = switch ($PasswordStatus.SelfChangePassword) {
-            'Allow'     { $C.Success }
-            'Deny'      { $C.Danger }
-            'NotListed' { $C.Warning }
-            default     { $C.TextPrimary }
+            { $_ -in @('AllowExplicit', 'AllowInherited') } { $C.Success }
+            'Deny'       { $C.Danger }
+            'NotAllowed' { $C.Warning }
+            default      { $C.TextPrimary }
         }
     } else {
         $vMustChg.Text = '-'; $vSelfChg.Text = '-'
@@ -1042,8 +1070,8 @@ $btnRstPwd.Add_Click({
         $extra = ''
         if ($script:CurPasswordStatus -and -not $script:CurPasswordStatus.CanChangeOwnPassword) {
             $extra = "`n`nNote: This account may still be unable to change its own password (check Cannot Change Pwd / SELF Change Pwd in Account Details)."
-        } elseif ($script:CurPasswordStatus -and $script:CurPasswordStatus.SelfChangePassword -eq 'NotListed') {
-            $extra = "`n`nIf the user gets Access Denied when changing password: AD Users and Computers > account Security > Advanced > SELF > Change Password = Allow."
+        } elseif ($script:CurPasswordStatus -and $script:CurPasswordStatus.SelfChangePassword -in @('NotAllowed', 'Deny')) {
+            $extra = "`n`nIf the user gets Access Denied when changing password: AD Users and Computers > Security > SELF > check Allow for Change password."
         }
         [System.Windows.Forms.MessageBox]::Show(
             "Password reset successfully.`n`nUsername:        $u`nTemp Password:  $p`n`nUser must change password at next logon (domain PC: Ctrl+Alt+Del > Change a password).$extra",

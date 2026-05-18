@@ -69,7 +69,7 @@ After a user lookup, **Account Details** shows fields that map to common helpdes
 |-------|----------------|
 | **Cannot Change Pwd** | AD account flag *User cannot change password*. Must be **No**. |
 | **Must Change Pwd** | *User must change password at next logon*. ADTools sets this when you use **Reset Password** here. Azure-only temp passwords may not set this on-prem. |
-| **SELF Change Pwd** | Explicit **SELF** extended right *Change Password* on the account (what Destin fixed in ADUC). **Not listed** = nothing explicit on the object (often still OK); if change fails with *Access denied*, set **Allow** on SELF. |
+| **SELF Change Pwd** | **SELF** extended right *Change password* (same as ADUC Security tab). **Allow (explicit)** / **Allow (inherited)** = user can change their own password. **Not allowed** or **DENIED** = fix in ADUC (Security > SELF > Allow *Change password*). |
 
 **ADTools reset (on-prem):** `Set-ADAccountPassword -Reset` and `Set-ADUser -ChangePasswordAtLogon $true`. User should change password on a **domain-joined PC** (Ctrl+Alt+Del), not only in a browser tab that may show session errors (e.g. 50133).
 
