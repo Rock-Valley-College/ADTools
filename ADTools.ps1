@@ -21,13 +21,13 @@
       (Domain Admin or delegated Event Log Reader on DCs)
 
 .NOTES
-    Version:  2.2.10
+    Version:  2.2.11
     GitHub:   https://github.com/Rock-Valley-College/ADTools
     Releases: https://github.com/Rock-Valley-College/ADTools/releases
 #>
 
 # -- VERSION -------------------------------------------------------------------
-$SCRIPT_VERSION = "2.2.10"
+$SCRIPT_VERSION = "2.2.11"
 $REPO_URL      = "https://github.com/Rock-Valley-College/ADTools"
 $RELEASES_URL  = "$REPO_URL/releases"
 
@@ -151,6 +151,10 @@ function Test-ADConnectivity {
         if (-not $Quiet) { return @{ Ready=$false; Error=$msg } }
         return @{ Ready=$false; Error=$msg }
     }
+}
+
+function Pump-WinFormsMessages {
+    try { [System.Windows.Forms.Application]::DoEvents() } catch { }
 }
 
 function Write-TerminalLog {
@@ -327,6 +331,7 @@ function Invoke-LockoutDiagnostics {
         } catch {
             Add-LogLine "  WARNING: Could not query $dc - $_" 'warn'
         }
+        Pump-WinFormsMessages
     }
 
     $orig = $dcState | Where-Object { $_.LockTime } | Sort-Object LockTime -Descending | Select-Object -First 1
@@ -367,6 +372,7 @@ function Invoke-LockoutDiagnostics {
     } else {
         Add-LogLine "  No 4740 events in last $HoursBack hour(s)." 'muted'
     }
+    Pump-WinFormsMessages
 
     $srcs = @($pdc)
     if ($orig -and $orig.DC -ne $pdc) { $srcs += $orig.DC }
@@ -412,6 +418,7 @@ function Invoke-LockoutDiagnostics {
                 SourceDC       = $src
             })
         }
+        Pump-WinFormsMessages
     }
 
     Add-LogLine '' 'normal'
@@ -531,6 +538,11 @@ function Test-MustChangePasswordAtLogon {
     return ($User.PasswordLastSet.ToUniversalTime().Year -le 1601)
 }
 
+function Get-AdObjectLdapPath {
+    param([Parameter(Mandatory)][string]$DistinguishedName)
+    return "LDAP://$DistinguishedName"
+}
+
 function Get-UserPasswordChangeStatus {
     param($User)
     $status = @{
@@ -550,9 +562,10 @@ function Get-UserPasswordChangeStatus {
 
     try {
         $changePwdGuid = [Guid]'ab721a53-1e2f-11d0-9819-00aa0040529b'
+        $ldapPath = Get-AdObjectLdapPath -DistinguishedName $User.DistinguishedName
         $acl = Invoke-LoggedAd {
-            Get-Acl -Path "AD:\$($User.DistinguishedName)" -ErrorAction Stop
-        } -CommandLabel "Get-Acl -Path 'AD:\$($User.SamAccountName)' (check SELF Change Password)"
+            Get-Acl -Path $ldapPath -ErrorAction Stop
+        } -CommandLabel "Get-Acl -Path 'LDAP://.../$($User.SamAccountName)' (SELF Change Password)"
         $selfSid = 'S-1-5-10'
         $selfAces = foreach ($ace in $acl.Access) {
             if ($ace.ObjectType -ne $changePwdGuid) { continue }
@@ -1116,22 +1129,9 @@ $btnRunDiag.Add_Click({
     Set-Status "Running lockout diagnostics for $sam..." "info"
     Write-TerminalLog "----- Lockout diagnostics: $sam ($hrs hours) -----" 'info'
 
-    $worker = New-Object System.ComponentModel.BackgroundWorker
-    $worker.Add_DoWork({
-        param($sender, $e)
-        $e.Result = Invoke-LockoutDiagnostics -SamAccountName $e.Argument.Sam -HoursBack $e.Argument.Hrs
-    })
-    $worker.Add_RunWorkerCompleted({
-        param($sender, $e)
-        $btnRunDiag.Enabled = $true
-        if ($e.Error) {
-            $msg = $e.Error.Message
-            Set-Status "Diagnostics failed: $msg" "error"
-            Write-Log $msg "error"
-            Write-TerminalLog "Diagnostics failed: $msg" 'err'
-            return
-        }
-        $d = $e.Result
+    [System.Windows.Forms.Application]::DoEvents()
+    try {
+        $d = Invoke-LockoutDiagnostics -SamAccountName $sam -HoursBack $hrs
         if ($d -and $d.O) {
             foreach ($logLine in $d.O) { Write-Log $logLine.Text $logLine.Type }
         }
@@ -1141,8 +1141,14 @@ $btnRunDiag.Add_Click({
         if ($script:DiagResults.Count -gt 0) { $btnExport.Enabled = $true }
         Set-Status "Diagnostics complete - $($script:DiagResults.Count) event(s) collected." "success"
         Write-TerminalLog "Diagnostics complete - $($script:DiagResults.Count) event(s) collected." 'ok'
-    })
-    $worker.RunWorkerAsync([pscustomobject]@{ Sam = $sam; Hrs = $hrs })
+    } catch {
+        $msg = $_.Exception.Message
+        Set-Status "Diagnostics failed: $msg" "error"
+        Write-Log $msg "error"
+        Write-TerminalLog "Diagnostics failed: $msg" 'err'
+    } finally {
+        $btnRunDiag.Enabled = $true
+    }
 })
 
 $btnClrLog.Add_Click({ $rtbLog.Clear(); $script:DiagResults.Clear(); $btnExport.Enabled=$false; Set-Status "Log cleared." "info" })
