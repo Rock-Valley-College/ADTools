@@ -21,15 +21,60 @@
       (Domain Admin or delegated Event Log Reader on DCs)
 
 .NOTES
-    Version:  2.1.2
+    Version:  2.2.1
     GitHub:   https://github.com/Rock-Valley-College/ADTools
     Releases: https://github.com/Rock-Valley-College/ADTools/releases
 #>
 
 # -- VERSION -------------------------------------------------------------------
-$SCRIPT_VERSION = "2.1.2"
+$SCRIPT_VERSION = "2.2.1"
 $REPO_URL      = "https://github.com/Rock-Valley-College/ADTools"
 $RELEASES_URL  = "$REPO_URL/releases"
+
+function Get-StartupLogPath {
+    if ($PSScriptRoot) { return Join-Path $PSScriptRoot 'ADTools-startup.log' }
+    return Join-Path $env:TEMP 'ADTools-startup.log'
+}
+
+function Show-StartupFailure {
+    param([string]$Message, [string]$Detail = '')
+    $logPath = Get-StartupLogPath
+    $entry = @(
+        "----- $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -----"
+        $Message
+        $Detail
+        ""
+    ) -join "`r`n"
+    try { Add-Content -LiteralPath $logPath -Value $entry -Encoding UTF8 } catch { }
+  try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue | Out-Null
+        [System.Windows.Forms.MessageBox]::Show(
+            "$Message`n`n$Detail`n`nLog: $logPath",
+            'ADTools',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    } catch {
+        Write-Host $Message -ForegroundColor Red
+        if ($Detail) { Write-Host $Detail }
+        Write-Host "Log: $logPath"
+    }
+}
+
+# WinForms requires an STA thread. Re-launch and WAIT so the window stays open.
+if ($PSCommandPath) {
+    $apt = [System.Threading.Thread]::CurrentThread.GetApartmentState()
+    if ($apt -ne [System.Threading.ApartmentState]::STA) {
+        $psExe = if ($PSVersionTable.PSEdition -eq 'Core') {
+            (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+        } else {
+            Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        }
+        if (-not $psExe -or -not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
+        $argList = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+        $proc = Start-Process -FilePath $psExe -ArgumentList $argList -Wait -PassThru
+        exit $(if ($null -ne $proc.ExitCode) { $proc.ExitCode } else { 0 })
+    }
+}
 
 # -- CONFIG (local config.json beside this script) -----------------------------
 $CONFIG = @{
@@ -49,9 +94,11 @@ if (Test-Path -LiteralPath $configPath) {
 }
 
 # -- BOOTSTRAP -----------------------------------------------------------------
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-[System.Windows.Forms.Application]::EnableVisualStyles()
+$script:StartupOk = $false
+try {
+Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+# Do not call EnableVisualStyles() - it lets Windows override our light text on dark backgrounds.
 
 $script:ADModuleReady = $false
 
@@ -172,36 +219,73 @@ function Get-OUFromDN {
     return $DN
 }
 
-# -- THEME ---------------------------------------------------------------------
+# -- THEME (standard light grey - readable on any Windows theme) ---------------
 $C = @{
-    Bg          = [System.Drawing.Color]::FromArgb(15,  20,  30)
-    Panel       = [System.Drawing.Color]::FromArgb(22,  30,  45)
-    Card        = [System.Drawing.Color]::FromArgb(28,  38,  58)
-    Border      = [System.Drawing.Color]::FromArgb(45,  60,  90)
-    Accent      = [System.Drawing.Color]::FromArgb(30, 130, 255)
-    Success     = [System.Drawing.Color]::FromArgb(34, 197, 100)
-    Warning     = [System.Drawing.Color]::FromArgb(250, 170,  30)
-    Danger      = [System.Drawing.Color]::FromArgb(240,  60,  60)
-    TextPrimary = [System.Drawing.Color]::FromArgb(220, 230, 245)
-    TextMuted   = [System.Drawing.Color]::FromArgb(110, 130, 160)
-    TextDim     = [System.Drawing.Color]::FromArgb(60,  80, 110)
-    InputBg     = [System.Drawing.Color]::FromArgb(18,  25,  40)
-    LogNormal   = [System.Drawing.Color]::FromArgb(180, 200, 230)
-    LogWarn     = [System.Drawing.Color]::FromArgb(250, 200,  60)
-    LogError    = [System.Drawing.Color]::FromArgb(240,  80,  80)
-    LogSuccess  = [System.Drawing.Color]::FromArgb(60,  210, 120)
-    LogMuted    = [System.Drawing.Color]::FromArgb(80,  100, 130)
-    LogAccent   = [System.Drawing.Color]::FromArgb(80,  160, 255)
+    Bg          = [System.Drawing.Color]::FromArgb(240, 240, 240)
+    Panel       = [System.Drawing.Color]::FromArgb(245, 245, 245)
+    Card        = [System.Drawing.Color]::White
+    Border      = [System.Drawing.Color]::FromArgb(200, 200, 200)
+    Accent      = [System.Drawing.Color]::FromArgb(0, 120, 215)
+    Success     = [System.Drawing.Color]::FromArgb(0, 110, 55)
+    Warning     = [System.Drawing.Color]::FromArgb(160, 90, 0)
+    Danger      = [System.Drawing.Color]::FromArgb(180, 0, 0)
+    TextPrimary = [System.Drawing.Color]::FromArgb(30, 30, 30)
+    TextMuted   = [System.Drawing.Color]::FromArgb(90, 90, 90)
+    TextDim     = [System.Drawing.Color]::FromArgb(120, 120, 120)
+    InputBg     = [System.Drawing.Color]::White
+    LogNormal   = [System.Drawing.Color]::FromArgb(30, 30, 30)
+    LogWarn     = [System.Drawing.Color]::FromArgb(140, 80, 0)
+    LogError    = [System.Drawing.Color]::FromArgb(180, 0, 0)
+    LogSuccess  = [System.Drawing.Color]::FromArgb(0, 110, 55)
+    LogMuted    = [System.Drawing.Color]::FromArgb(100, 100, 100)
+    LogAccent   = [System.Drawing.Color]::FromArgb(0, 90, 180)
 }
 $F = @{
     Title   = New-Object System.Drawing.Font("Segoe UI",13,[System.Drawing.FontStyle]::Bold)
     Heading = New-Object System.Drawing.Font("Segoe UI",9, [System.Drawing.FontStyle]::Bold)
     Normal  = New-Object System.Drawing.Font("Segoe UI",9)
     Small   = New-Object System.Drawing.Font("Segoe UI",8)
-    Micro   = New-Object System.Drawing.Font("Segoe UI",7.5)
+    Micro   = New-Object System.Drawing.Font("Segoe UI",8)
     Mono    = New-Object System.Drawing.Font("Consolas",10,[System.Drawing.FontStyle]::Bold)
     MonoSm  = New-Object System.Drawing.Font("Consolas",9)
     MonoLog = New-Object System.Drawing.Font("Consolas",8.5)
+}
+
+function Set-ControlDarkStyle {
+    param(
+        [System.Windows.Forms.Control]$Control,
+        [System.Drawing.Color]$BackColor = [System.Drawing.Color]::Empty
+    )
+    try {
+        $styleProp = $Control.GetType().GetProperty('UseVisualStyleBackColor')
+        if ($styleProp) { $styleProp.SetValue($Control, $false, $null) }
+        if ($BackColor -ne [System.Drawing.Color]::Empty) { $Control.BackColor = $BackColor }
+    } catch { }
+}
+
+function Set-TabNavStyle {
+    param([System.Windows.Forms.Button]$Button, [bool]$Selected)
+    Set-ControlDarkStyle $Button $(if ($Selected) { $C.Card } else { $C.Bg })
+    $Button.ForeColor = $C.TextPrimary
+    $Button.Font = if ($Selected) { $F.Heading } else { $F.Normal }
+    $Button.FlatStyle = 'Flat'
+    if ($Selected) {
+        $Button.FlatAppearance.BorderColor = $C.Accent
+        $Button.FlatAppearance.BorderSize = 2
+    } else {
+        $Button.FlatAppearance.BorderColor = $C.Border
+        $Button.FlatAppearance.BorderSize = 1
+    }
+}
+
+function Switch-AppTab {
+    param([ValidateSet('User', 'Lockout')][string]$Name)
+    $userOn = ($Name -eq 'User')
+    $pnlUserTab.Visible = $userOn
+    $pnlLockoutTab.Visible = -not $userOn
+    Set-TabNavStyle $btnTabUser $userOn
+    Set-TabNavStyle $btnTabLockout (-not $userOn)
+    if ($userOn) { $txtUserSearch.Focus() }
 }
 
 # -- FORM ----------------------------------------------------------------------
@@ -215,31 +299,47 @@ $form.ForeColor       = $C.TextPrimary
 $form.FormBorderStyle = "Sizable"
 $form.Font            = $F.Normal
 
-# Header
+# Header (title + tab buttons - tabs live here so they cannot be covered by Fill panels)
 $pnlHeader = New-Object System.Windows.Forms.Panel
-$pnlHeader.Dock=      "Top"; $pnlHeader.Height=50; $pnlHeader.BackColor=$C.Panel
-$form.Controls.Add($pnlHeader)
+$pnlHeader.Dock="Top"; $pnlHeader.Height=96; $pnlHeader.BackColor=$C.Panel
 
 $lblAppTitle = New-Object System.Windows.Forms.Label
 $lblAppTitle.Text="RVC ADTools"; $lblAppTitle.Font=$F.Title
 $lblAppTitle.ForeColor=$C.TextPrimary; $lblAppTitle.AutoSize=$true
-$lblAppTitle.Location=New-Object System.Drawing.Point(8,12)
+Set-ControlDarkStyle $lblAppTitle $C.Panel
+$lblAppTitle.Location=New-Object System.Drawing.Point(8,10)
 $pnlHeader.Controls.Add($lblAppTitle)
 
 $lblVerBadge = New-Object System.Windows.Forms.Label
 $lblVerBadge.Text="v$SCRIPT_VERSION"; $lblVerBadge.Font=$F.Micro
-$lblVerBadge.ForeColor=$C.TextDim; $lblVerBadge.AutoSize=$true
-$lblVerBadge.Anchor="Top,Right"; $lblVerBadge.Location=New-Object System.Drawing.Point(830,36)
+$lblVerBadge.ForeColor=$C.TextMuted; $lblVerBadge.AutoSize=$true
+Set-ControlDarkStyle $lblVerBadge $C.Panel
+$lblVerBadge.Anchor="Top,Right"; $lblVerBadge.Location=New-Object System.Drawing.Point(830,14)
 $pnlHeader.Controls.Add($lblVerBadge)
+
+$pnlTabBar = New-Object System.Windows.Forms.Panel
+$pnlTabBar.Dock="Bottom"; $pnlTabBar.Height=48; $pnlTabBar.BackColor=$C.Bg
+
+$btnTabUser = New-Object System.Windows.Forms.Button
+$btnTabUser.Text="User"; $btnTabUser.Width=200; $btnTabUser.Height=40
+$btnTabUser.Dock="Left"; $btnTabUser.Cursor="Hand"
+
+$btnTabLockout = New-Object System.Windows.Forms.Button
+$btnTabLockout.Text="Lockout Diagnostics"; $btnTabLockout.Height=40
+$btnTabLockout.Dock="Fill"; $btnTabLockout.Cursor="Hand"
+
+$pnlTabBar.Controls.Add($btnTabLockout)
+$pnlTabBar.Controls.Add($btnTabUser)
+$pnlHeader.Controls.Add($pnlTabBar)
 
 # Status bar
 $pnlStatus = New-Object System.Windows.Forms.Panel
 $pnlStatus.Dock="Bottom"; $pnlStatus.Height=26; $pnlStatus.BackColor=$C.Panel
-$form.Controls.Add($pnlStatus)
 
 $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.Text="Ready."; $lblStatus.Font=$F.Small
-$lblStatus.ForeColor=$C.TextMuted; $lblStatus.AutoSize=$true
+$lblStatus.ForeColor=$C.TextPrimary; $lblStatus.AutoSize=$true
+Set-ControlDarkStyle $lblStatus $C.Panel
 $lblStatus.Location=New-Object System.Drawing.Point(14,6)
 $pnlStatus.Controls.Add($lblStatus)
 
@@ -247,6 +347,7 @@ $lnkUpdates = New-Object System.Windows.Forms.LinkLabel
 $lnkUpdates.Text="Get latest version"; $lnkUpdates.Font=$F.Small
 $lnkUpdates.LinkColor=$C.Accent; $lnkUpdates.ActiveLinkColor=$C.Accent
 $lnkUpdates.VisitedLinkColor=$C.TextMuted; $lnkUpdates.AutoSize=$true
+Set-ControlDarkStyle $lnkUpdates $C.Panel
 $lnkUpdates.Cursor=[System.Windows.Forms.Cursors]::Hand
 $lnkUpdates.Anchor="Top,Right"
 $pnlStatus.Controls.Add($lnkUpdates)
@@ -258,38 +359,32 @@ $lnkUpdates.Location=New-Object System.Drawing.Point(780,6)
 
 function Set-Status {
     param([string]$Msg,[string]$Type="info")
-    $lblStatus.ForeColor=switch($Type){"success"{$C.Success}"error"{$C.Danger}"warning"{$C.Warning}default{$C.TextMuted}}
+    $lblStatus.ForeColor=switch($Type){"success"{$C.Success}"error"{$C.Danger}"warning"{$C.Warning}default{$C.TextPrimary}}
     $lblStatus.Text=$Msg
 }
 
-# -- TABS ----------------------------------------------------------------------
-$tabs = New-Object System.Windows.Forms.TabControl
-$tabs.Dock="Fill"; $tabs.Font=$F.Heading
-$tabs.DrawMode="OwnerDrawFixed"
-$tabs.ItemSize=New-Object System.Drawing.Size(180,32)
-$tabs.SizeMode="Fixed"
-$form.Controls.Add($tabs)
+# -- MAIN (tab content; nav buttons are in the header) --------------------------
+$pnlShell = New-Object System.Windows.Forms.Panel
+$pnlShell.Dock="Fill"; $pnlShell.BackColor=$C.Bg
 
-$tabs.Add_DrawItem({
-    param($s,$e)
-    $tab=$s.TabPages[$e.Index]; $sel=($e.Index -eq $s.SelectedIndex)
-    $bg=if($sel){$C.Card}else{$C.Panel}; $fg=if($sel){$C.TextPrimary}else{$C.TextMuted}
-    $e.Graphics.FillRectangle((New-Object System.Drawing.SolidBrush($bg)),$e.Bounds)
-    if($sel){$e.Graphics.FillRectangle((New-Object System.Drawing.SolidBrush($C.Accent)),
-        (New-Object System.Drawing.Rectangle($e.Bounds.X,$e.Bounds.Y,$e.Bounds.Width,3)))}
-    $sf=New-Object System.Drawing.StringFormat
-    $sf.Alignment=[System.Drawing.StringAlignment]::Center
-    $sf.LineAlignment=[System.Drawing.StringAlignment]::Center
-    $e.Graphics.DrawString($tab.Text,$F.Heading,(New-Object System.Drawing.SolidBrush($fg)),[System.Drawing.RectangleF]$e.Bounds,$sf)
-})
+$pnlUserTab = New-Object System.Windows.Forms.Panel
+$pnlUserTab.Dock="Fill"; $pnlUserTab.BackColor=$C.Bg; $pnlUserTab.Visible=$true
 
-$tabUser    = New-Object System.Windows.Forms.TabPage; $tabUser.Text="User"
-$tabUser.BackColor=$C.Bg; $tabUser.ForeColor=$C.TextPrimary
-$tabs.TabPages.Add($tabUser)
+$pnlLockoutTab = New-Object System.Windows.Forms.Panel
+$pnlLockoutTab.Dock="Fill"; $pnlLockoutTab.BackColor=$C.Bg; $pnlLockoutTab.Visible=$false
 
-$tabLockout = New-Object System.Windows.Forms.TabPage; $tabLockout.Text="Lockout Diagnostics"
-$tabLockout.BackColor=$C.Bg; $tabLockout.ForeColor=$C.TextPrimary
-$tabs.TabPages.Add($tabLockout)
+$pnlShell.Controls.Add($pnlLockoutTab)
+$pnlShell.Controls.Add($pnlUserTab)
+
+$btnTabUser.Add_Click({ Switch-AppTab -Name User })
+$btnTabLockout.Add_Click({ Switch-AppTab -Name Lockout })
+Set-TabNavStyle $btnTabUser $true
+Set-TabNavStyle $btnTabLockout $false
+
+# Dock order: Top/Bottom first, Fill last
+$form.Controls.Add($pnlHeader)
+$form.Controls.Add($pnlStatus)
+$form.Controls.Add($pnlShell)
 
 # ==============================================================================
 # TAB 1 - USER
@@ -297,44 +392,53 @@ $tabs.TabPages.Add($tabLockout)
 
 $pnlUserSearch = New-Object System.Windows.Forms.Panel
 $pnlUserSearch.Dock="Top"; $pnlUserSearch.Height=50; $pnlUserSearch.BackColor=$C.Bg
-$tabUser.Controls.Add($pnlUserSearch)
+
+$pnlUserContent = New-Object System.Windows.Forms.Panel
+$pnlUserContent.Dock="Fill"; $pnlUserContent.BackColor=$C.Bg
+$pnlUserContent.Padding=New-Object System.Windows.Forms.Padding(12,4,12,4)
 
 function New-Lbl { param($parent,$text,$font,$color,$x,$y,$autosize=$true)
     $lblCtrl=New-Object System.Windows.Forms.Label; $lblCtrl.Text=$text; $lblCtrl.Font=$font
-    $lblCtrl.ForeColor=$color; $lblCtrl.AutoSize=$autosize; $lblCtrl.Location=New-Object System.Drawing.Point($x,$y)
+    $lblCtrl.AutoSize=$autosize; $lblCtrl.Location=New-Object System.Drawing.Point($x,$y)
+    Set-ControlDarkStyle $lblCtrl $parent.BackColor
+    $lblCtrl.ForeColor=$color
     $parent.Controls.Add($lblCtrl); return $lblCtrl }
 function New-Btn { param($parent,$text,$font,$bg,$fg,$x,$y,$w,$h,[bool]$enabled=$true)
     $b=New-Object System.Windows.Forms.Button; $b.Text=$text; $b.Font=$font
     $b.BackColor=$bg; $b.ForeColor=$fg; $b.Size=New-Object System.Drawing.Size($w,$h)
     $b.Location=New-Object System.Drawing.Point($x,$y); $b.FlatStyle="Flat"
     $b.FlatAppearance.BorderSize=0; $b.Cursor="Hand"; $b.Enabled=$enabled
+    Set-ControlDarkStyle $b
+    $b.ForeColor=$fg
     $parent.Controls.Add($b); return $b }
 function New-Txt { param($parent,$x,$y,$w,$font)
     $t=New-Object System.Windows.Forms.TextBox; $t.Size=New-Object System.Drawing.Size($w,26)
     $t.Location=New-Object System.Drawing.Point($x,$y); $t.BackColor=$C.InputBg
     $t.ForeColor=$C.TextPrimary; $t.BorderStyle="FixedSingle"; $t.Font=$font
+    Set-ControlDarkStyle $t $C.InputBg
     $parent.Controls.Add($t); return $t }
 
-New-Lbl $pnlUserSearch "Username" $F.Heading $C.TextMuted 12 17 | Out-Null
-$txtUserSearch = New-Txt $pnlUserSearch 98 13 240 $F.Mono
-$btnUserSearch = New-Btn $pnlUserSearch "Look Up" $F.Heading $C.Accent ([System.Drawing.Color]::White) 350 13 86 26
-$lblUserStatus = New-Lbl $pnlUserSearch "Enter a username to get started." $F.Small $C.TextMuted 452 17
+$pnlUserTab.Controls.Add($pnlUserSearch)
+$pnlUserTab.Controls.Add($pnlUserContent)
 
-$pnlUserContent = New-Object System.Windows.Forms.Panel
-$pnlUserContent.Dock="Fill"; $pnlUserContent.BackColor=$C.Bg
-$pnlUserContent.Padding=New-Object System.Windows.Forms.Padding(12,4,12,4)
-$tabUser.Controls.Add($pnlUserContent)
+New-Lbl $pnlUserSearch "Username" $F.Heading $C.TextPrimary 12 17 | Out-Null
+$txtUserSearch = New-Txt $pnlUserSearch 98 13 320 $F.Mono
+$btnUserSearch = New-Btn $pnlUserSearch "Look Up" $F.Heading $C.Accent ([System.Drawing.Color]::White) 430 13 86 26
 
 $pnlUL = New-Object System.Windows.Forms.Panel; $pnlUL.BackColor=$C.Bg
 $pnlUR = New-Object System.Windows.Forms.Panel; $pnlUR.BackColor=$C.Bg
 $pnlUserContent.Controls.Add($pnlUL); $pnlUserContent.Controls.Add($pnlUR)
 
 $pnlUserContent.Add_Resize({
-    $contentW=$pnlUserContent.ClientSize.Width-8; $contentH=$pnlUserContent.ClientSize.Height-4
-    $leftW=[int]($contentW*0.46); $rightW=$contentW-$leftW-12
-    $pnlUL.Size=New-Object System.Drawing.Size($leftW,$contentH)
-    $pnlUR.Location=New-Object System.Drawing.Point(($leftW+12),0)
-    $pnlUR.Size=New-Object System.Drawing.Size($rightW,$contentH)
+    try {
+        if ($pnlUserContent.ClientSize.Width -lt 80) { return }
+        $contentW=$pnlUserContent.ClientSize.Width-8; $contentH=$pnlUserContent.ClientSize.Height-4
+        $leftW=[int]($contentW*0.46); $rightW=$contentW-$leftW-12
+        if ($rightW -lt 40) { return }
+        $pnlUL.Size=New-Object System.Drawing.Size($leftW,$contentH)
+        $pnlUR.Location=New-Object System.Drawing.Point(($leftW+12),0)
+        $pnlUR.Size=New-Object System.Drawing.Size($rightW,$contentH)
+    } catch { }
 })
 # Trigger initial layout
 $pnlUL.Size=New-Object System.Drawing.Size(390,600); $pnlUL.Location=New-Object System.Drawing.Point(0,0)
@@ -347,7 +451,7 @@ function New-Card {
     $card.Location=New-Object System.Drawing.Point(0,$Y)
     $card.BackColor=$C.Card; $card.Anchor="Top,Left,Right"
     $Parent.Controls.Add($card)
-    if($Title){ New-Lbl $card $Title.ToUpper() $F.Micro $C.TextDim 14 10 | Out-Null }
+    if($Title){ New-Lbl $card $Title.ToUpper() $F.Micro $C.TextMuted 14 10 | Out-Null }
     return $card
 }
 
@@ -358,13 +462,13 @@ $lblDN.Size=New-Object System.Drawing.Size(360,30)
 $lblUN2  = New-Lbl $cId "-" $F.MonoSm $C.Accent 14 62
 $lblMail = New-Lbl $cId "-" $F.Small $C.TextMuted 14 82
 $lblDept = New-Lbl $cId "-" $F.Small $C.TextMuted 14 100
-$lblStat = New-Lbl $cId "" $F.Heading $C.TextDim 14 124
+$lblStat = New-Lbl $cId "" $F.Heading $C.TextMuted 14 124
 $lblLock = New-Lbl $cId "" $F.Heading $C.Danger 120 124
 
 # Details
 $cDet = New-Card $pnlUL "Account Details" 163 215
 function New-DR { param($card,$lbl,$y)
-    New-Lbl $card $lbl $F.Small $C.TextDim 14 $y | Out-Null
+    New-Lbl $card $lbl $F.Small $C.TextMuted 14 $y | Out-Null
     $v=New-Lbl $card "-" $F.Small $C.TextPrimary 158 $y; $v.Size=New-Object System.Drawing.Size(220,16); return $v }
 $vCreated = New-DR $cDet "Created"            28
 $vLogon   = New-DR $cDet "Last Logon"         50
@@ -376,16 +480,17 @@ $vOU      = New-DR $cDet "OU"                 160
 
 # Password reset
 $cPwd = New-Card $pnlUL "Password Reset" 386 150
-New-Lbl $cPwd "Temporary Password" $F.Heading $C.TextMuted 14 28 | Out-Null
+New-Lbl $cPwd "Temporary Password" $F.Heading $C.TextPrimary 14 28 | Out-Null
 $txtPwd    = New-Txt   $cPwd 14 48 212 $F.Mono
-$btnGenPwd = New-Btn   $cPwd "New" $F.Small $C.Card $C.Accent 234 48 56 24 $false
+$btnGenPwd = New-Btn   $cPwd "New" $F.Small $C.Bg $C.TextPrimary 234 48 56 24 $false
 $btnGenPwd.FlatAppearance.BorderColor=$C.Border; $btnGenPwd.FlatAppearance.BorderSize=1
-$btnCpyPwd = New-Btn   $cPwd "Copy" $F.Small $C.Card $C.TextMuted 298 48 52 24 $false
+$btnCpyPwd = New-Btn   $cPwd "Copy" $F.Small $C.Bg $C.TextPrimary 298 48 52 24 $false
 $btnCpyPwd.FlatAppearance.BorderColor=$C.Border; $btnCpyPwd.FlatAppearance.BorderSize=1
 $chkShow   = New-Object System.Windows.Forms.CheckBox; $chkShow.Text="Show password"
-$chkShow.Font=$F.Small; $chkShow.ForeColor=$C.TextMuted; $chkShow.AutoSize=$true
+$chkShow.Font=$F.Small; $chkShow.ForeColor=$C.TextPrimary; $chkShow.AutoSize=$true
 $chkShow.Checked=$true; $chkShow.Location=New-Object System.Drawing.Point(14,80)
-$chkShow.FlatStyle="Flat"; $cPwd.Controls.Add($chkShow)
+$chkShow.FlatStyle="Flat"; Set-ControlDarkStyle $chkShow $C.Card
+$cPwd.Controls.Add($chkShow)
 $btnRstPwd = New-Btn   $cPwd "Reset Password" $F.Heading $C.Accent ([System.Drawing.Color]::White) 14 106 344 32 $false
 
 # Right - Groups
@@ -399,11 +504,11 @@ $cGrp.Controls.Add($lstGroups)
 
 # Right - Actions
 $cAct = New-Card $pnlUR "Actions" 403 84
-$btnUnlock  = New-Btn $cAct "Unlock Account"    $F.Heading $C.Card $C.Warning  14  30 180 34 $false
+$btnUnlock  = New-Btn $cAct "Unlock Account"    $F.Heading $C.Bg $C.TextPrimary  14  30 180 34 $false
 $btnUnlock.FlatAppearance.BorderColor=$C.Warning; $btnUnlock.FlatAppearance.BorderSize=1
-$btnRefresh = New-Btn $cAct "Refresh"             $F.Heading $C.Card $C.TextMuted 206 30 110 34 $false
+$btnRefresh = New-Btn $cAct "Refresh"             $F.Heading $C.Bg $C.TextPrimary 206 30 110 34 $false
 $btnRefresh.FlatAppearance.BorderColor=$C.Border; $btnRefresh.FlatAppearance.BorderSize=1
-$btnDiag    = New-Btn $cAct "Diagnose Lockout"   $F.Heading $C.Card $C.Danger   330 30 180 34 $false
+$btnDiag    = New-Btn $cAct "Diagnose Lockout"   $F.Heading $C.Bg $C.TextPrimary   330 30 180 34 $false
 $btnDiag.FlatAppearance.BorderColor=$C.Danger; $btnDiag.FlatAppearance.BorderSize=1
 $btnDiag.Visible=$false
 
@@ -467,10 +572,10 @@ function Invoke-USearch {
     $btnUserSearch.Enabled=$false
     $r=Get-UserAccount -Username $u
     $btnUserSearch.Enabled=$true
-    if(-not $r.Success){ Set-Status $r.Error "error"; $lblUserStatus.Text=$r.Error; return }
+    if(-not $r.Success){ Set-Status $r.Error "error"; return }
     $script:CurUser=$r.User; $script:CurGroups=$r.Groups
     Show-UData -User $r.User -Groups $r.Groups
-    $lblUserStatus.Text=""; Set-Status "Loaded: $($r.User.DisplayName)  |  $($r.Groups.Count) group(s)" "success"
+    Set-Status "Loaded: $($r.User.DisplayName)  |  $($r.Groups.Count) group(s)" "success"
 }
 
 $btnUserSearch.Add_Click({ Invoke-USearch })
@@ -515,7 +620,7 @@ $btnUnlock.Add_Click({
 
 # Diagnose button - prefill lockout tab and switch to it
 $btnDiag.Add_Click({
-    if($script:CurUser){ $txtLockoutUser.Text=$script:CurUser.SamAccountName; $tabs.SelectedTab=$tabLockout }
+    if($script:CurUser){ $txtLockoutUser.Text=$script:CurUser.SamAccountName; Switch-AppTab -Name Lockout }
 })
 
 # ==============================================================================
@@ -524,34 +629,36 @@ $btnDiag.Add_Click({
 
 $pnlLkCtrl = New-Object System.Windows.Forms.Panel
 $pnlLkCtrl.Dock="Top"; $pnlLkCtrl.Height=54; $pnlLkCtrl.BackColor=$C.Bg
-$tabLockout.Controls.Add($pnlLkCtrl)
-
-New-Lbl $pnlLkCtrl "Username" $F.Heading $C.TextMuted 12 18 | Out-Null
-$txtLockoutUser = New-Txt $pnlLkCtrl 98 15 200 $F.Mono
-New-Lbl $pnlLkCtrl "Hours back" $F.Heading $C.TextMuted 570 19 | Out-Null
-
-$numHours = New-Object System.Windows.Forms.NumericUpDown
-$numHours.Size=New-Object System.Drawing.Size(62,24); $numHours.Location=New-Object System.Drawing.Point(660,15)
-$numHours.Minimum=1; $numHours.Maximum=168; $numHours.Value=24
-$numHours.BackColor=$C.InputBg; $numHours.ForeColor=$C.TextPrimary; $numHours.Font=$F.Mono
-$pnlLkCtrl.Controls.Add($numHours)
-
-$btnRunDiag = New-Btn $pnlLkCtrl "Run Diagnostics" $F.Heading $C.Accent ([System.Drawing.Color]::White) 736 14 162 28
 
 $pnlLkAct = New-Object System.Windows.Forms.Panel
 $pnlLkAct.Dock="Top"; $pnlLkAct.Height=34; $pnlLkAct.BackColor=$C.Bg
-$tabLockout.Controls.Add($pnlLkAct)
-
-$btnExport = New-Btn $pnlLkAct "Export CSV" $F.Small $C.Card $C.TextMuted 12 4 120 26 $false
-$btnExport.FlatAppearance.BorderColor=$C.Border; $btnExport.FlatAppearance.BorderSize=1
-$btnClrLog = New-Btn $pnlLkAct "Clear"         $F.Small $C.Card $C.TextDim  140 4  70 26
-$btnClrLog.FlatAppearance.BorderColor=$C.Border; $btnClrLog.FlatAppearance.BorderSize=1
 
 $rtbLog = New-Object System.Windows.Forms.RichTextBox
 $rtbLog.Dock="Fill"; $rtbLog.BackColor=$C.InputBg; $rtbLog.ForeColor=$C.LogNormal
 $rtbLog.BorderStyle="None"; $rtbLog.Font=$F.MonoLog; $rtbLog.ReadOnly=$true
 $rtbLog.WordWrap=$false; $rtbLog.ScrollBars="Both"
-$tabLockout.Controls.Add($rtbLog)
+
+$pnlLockoutTab.Controls.Add($pnlLkCtrl)
+$pnlLockoutTab.Controls.Add($pnlLkAct)
+$pnlLockoutTab.Controls.Add($rtbLog)
+
+New-Lbl $pnlLkCtrl "Username" $F.Heading $C.TextPrimary 12 18 | Out-Null
+$txtLockoutUser = New-Txt $pnlLkCtrl 98 15 200 $F.Mono
+New-Lbl $pnlLkCtrl "Hours back" $F.Heading $C.TextPrimary 570 19 | Out-Null
+
+$numHours = New-Object System.Windows.Forms.NumericUpDown
+$numHours.Size=New-Object System.Drawing.Size(62,24); $numHours.Location=New-Object System.Drawing.Point(660,15)
+$numHours.Minimum=1; $numHours.Maximum=168; $numHours.Value=24
+$numHours.BackColor=$C.InputBg; $numHours.ForeColor=$C.TextPrimary; $numHours.Font=$F.Mono
+Set-ControlDarkStyle $numHours $C.InputBg
+$pnlLkCtrl.Controls.Add($numHours)
+
+$btnRunDiag = New-Btn $pnlLkCtrl "Run Diagnostics" $F.Heading $C.Accent ([System.Drawing.Color]::White) 736 14 162 28
+
+$btnExport = New-Btn $pnlLkAct "Export CSV" $F.Small $C.Bg $C.TextPrimary 12 4 120 26 $false
+$btnExport.FlatAppearance.BorderColor=$C.Border; $btnExport.FlatAppearance.BorderSize=1
+$btnClrLog = New-Btn $pnlLkAct "Clear"         $F.Small $C.Bg $C.TextPrimary  140 4  70 26
+$btnClrLog.FlatAppearance.BorderColor=$C.Border; $btnClrLog.FlatAppearance.BorderSize=1
 
 function Write-Log {
     param([string]$Text,[string]$Type="normal")
@@ -695,15 +802,33 @@ $btnExport.Add_Click({
 })
 
 $form.Add_Shown({
-    $txtUserSearch.Focus()
-    $ad = Ensure-ADModule
-    if (-not $ad.Ready) {
-        Set-Status $ad.Error "warning"
-        return
+    try {
+        $txtUserSearch.Focus()
+        $ad = Ensure-ADModule
+        if (-not $ad.Ready) {
+            Set-Status $ad.Error "warning"
+            return
+        }
+        $conn = Test-ADConnectivity -Quiet
+        if (-not $conn.Ready) { Set-Status $conn.Error "warning" }
+    } catch {
+        Set-Status "Startup check failed: $($_.Exception.Message)" "error"
     }
-    $conn = Test-ADConnectivity -Quiet
-    if (-not $conn.Ready) { Set-Status $conn.Error "warning" }
 })
 
+$script:StartupOk = $true
+
+} catch {
+    Show-StartupFailure 'ADTools could not start.' $_.Exception.ToString()
+    exit 1
+}
+
+if (-not $script:StartupOk) { exit 1 }
+
 # -- RUN -----------------------------------------------------------------------
-[System.Windows.Forms.Application]::Run($form)
+try {
+    [void][System.Windows.Forms.Application]::Run($form)
+} catch {
+    Show-StartupFailure 'ADTools closed unexpectedly.' $_.Exception.ToString()
+    exit 1
+}

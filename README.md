@@ -35,9 +35,17 @@ Unblock-File .\ADTools.ps1   # once, if downloaded from the internet
 .\ADTools.ps1
 ```
 
+If the window flashes and closes, run with STA explicitly (required for WinForms):
+
+```powershell
+powershell -STA -File .\ADTools.ps1
+```
+
+Startup errors are also written to `ADTools-startup.log` beside the script (or in `%TEMP%`).
+
 The app opens even when the domain is unreachable (for example, off VPN). AD actions show a status message until you are connected. Install the RSAT Active Directory module on the PC; domain-joined is recommended when you run lookups and resets.
 
-**Note:** The script is saved as ASCII-only (UTF-8 with BOM) so PowerShell 5.1 on any Windows locale parses it correctly.
+**Note:** The script is saved as ASCII-only (UTF-8 with BOM) so PowerShell 5.1 on any Windows locale parses it correctly. The UI uses a standard light grey theme so text stays readable regardless of Windows dark/light mode.
 
 ## Configuration
 
