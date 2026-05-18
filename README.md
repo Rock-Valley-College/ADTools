@@ -31,8 +31,13 @@ Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0
 
 ```powershell
 cd C:\Tools\ADTools
+Unblock-File .\ADTools.ps1   # once, if downloaded from the internet
 .\ADTools.ps1
 ```
+
+The app opens even when the domain is unreachable (for example, off VPN). AD actions show a status message until you are connected. Install the RSAT Active Directory module on the PC; domain-joined is recommended when you run lookups and resets.
+
+**Note:** The script is saved as ASCII-only (UTF-8 with BOM) so PowerShell 5.1 on any Windows locale parses it correctly.
 
 ## Configuration
 

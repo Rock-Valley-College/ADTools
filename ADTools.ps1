@@ -1,18 +1,16 @@
-#Requires -Modules ActiveDirectory
-
 <#
 .SYNOPSIS
-    RVC ADTools — Active Directory Helpdesk Toolkit
+    RVC ADTools - Active Directory Helpdesk Toolkit
 .DESCRIPTION
     A tabbed helpdesk tool for Active Directory management.
 
-    Tab 1 — User:               Look up any AD account, view full details,
+    Tab 1 - User:               Look up any AD account, view full details,
                                  group memberships, reset password, unlock.
-    Tab 2 — Lockout Diagnostics: Find what's causing account lockouts by
+    Tab 2 - Lockout Diagnostics: Find what's causing account lockouts by
                                  querying all DCs and pulling Security event
                                  log entries (4740 lockout, 4625 bad logon).
 
-    Access control is enforced by AD delegation — this script can only affect
+    Access control is enforced by AD delegation - this script can only affect
     accounts your AD account has been granted rights over.
 
     REQUIREMENTS:
@@ -23,17 +21,17 @@
       (Domain Admin or delegated Event Log Reader on DCs)
 
 .NOTES
-    Version:  2.1.0
+    Version:  2.1.1
     GitHub:   https://github.com/Rock-Valley-College/ADTools
     Releases: https://github.com/Rock-Valley-College/ADTools/releases
 #>
 
-# ── VERSION ───────────────────────────────────────────────────────────────────
-$SCRIPT_VERSION = "2.1.0"
+# -- VERSION -------------------------------------------------------------------
+$SCRIPT_VERSION = "2.1.1"
 $REPO_URL      = "https://github.com/Rock-Valley-College/ADTools"
 $RELEASES_URL  = "$REPO_URL/releases"
 
-# ── CONFIG (local config.json beside this script) ─────────────────────────────
+# -- CONFIG (local config.json beside this script) -----------------------------
 $CONFIG = @{
     MinPasswordLength  = 16
     TempPasswordLength = 16
@@ -50,23 +48,52 @@ if (Test-Path -LiteralPath $configPath) {
     } catch { }
 }
 
-# ── BOOTSTRAP ─────────────────────────────────────────────────────────────────
+# -- BOOTSTRAP -----------------------------------------------------------------
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-    [System.Windows.Forms.MessageBox]::Show(
-        "The ActiveDirectory PowerShell module is not installed.`n`nRun this in an elevated PowerShell window:`n`nAdd-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0",
-        "Missing: RSAT ActiveDirectory Module",
-        [System.Windows.Forms.MessageBoxButtons]::OK,
-        [System.Windows.Forms.MessageBoxIcon]::Error
-    ) | Out-Null
-    exit 1
-}
-Import-Module ActiveDirectory -ErrorAction Stop
+$script:ADModuleReady = $false
 
-# ── HELPERS ───────────────────────────────────────────────────────────────────
+function Ensure-ADModule {
+    if ($script:ADModuleReady -and (Get-Module -Name ActiveDirectory)) {
+        return @{ Ready=$true; Error='' }
+    }
+    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+        return @{
+            Ready = $false
+            Error = 'ActiveDirectory module is not installed. Install RSAT: Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0'
+        }
+    }
+    $prevDrive = $Env:ADPS_LoadDefaultDrive
+    $Env:ADPS_LoadDefaultDrive = '0'
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        $script:ADModuleReady = $true
+        return @{ Ready=$true; Error='' }
+    } catch {
+        return @{ Ready=$false; Error="Could not load Active Directory module: $($_.Exception.Message)" }
+    } finally {
+        if ($null -eq $prevDrive) { Remove-Item Env:ADPS_LoadDefaultDrive -ErrorAction SilentlyContinue }
+        else { $Env:ADPS_LoadDefaultDrive = $prevDrive }
+    }
+}
+
+function Test-ADConnectivity {
+    param([switch]$Quiet)
+    $ad = Ensure-ADModule
+    if (-not $ad.Ready) { return $ad }
+    try {
+        Get-ADDomain -ErrorAction Stop | Out-Null
+        return @{ Ready=$true; Error='' }
+    } catch {
+        $msg = 'Domain not reachable. Connect to your network or VPN, then try again.'
+        if (-not $Quiet) { return @{ Ready=$false; Error=$msg } }
+        return @{ Ready=$false; Error=$msg }
+    }
+}
+
+# -- HELPERS -------------------------------------------------------------------
 function Test-SamAccountName {
     param([string]$Username)
     if ([string]::IsNullOrWhiteSpace($Username)) { return @{ Valid=$false; Error="Please enter a username." } }
@@ -90,6 +117,8 @@ function Get-UserAccount {
     $result = @{ Success=$false; User=$null; Groups=@(); Error="" }
     $nameCheck = Test-SamAccountName -Username $Username
     if (-not $nameCheck.Valid) { $result.Error=$nameCheck.Error; return $result }
+    $ad = Test-ADConnectivity
+    if (-not $ad.Ready) { $result.Error=$ad.Error; return $result }
     try {
         $user = Get-ADUser -Identity $Username -Properties `
             DisplayName,EmailAddress,Department,Title,DistinguishedName,Enabled,LockedOut,
@@ -108,11 +137,13 @@ function Invoke-PasswordReset {
     param([string]$Username,[string]$NewPassword)
     $result = @{ Success=$false; Error="" }
     if ($NewPassword.Length -lt $CONFIG.MinPasswordLength) { $result.Error="Password must be at least $($CONFIG.MinPasswordLength) characters."; return $result }
+    $ad = Test-ADConnectivity
+    if (-not $ad.Ready) { $result.Error=$ad.Error; return $result }
     try {
         Set-ADAccountPassword -Identity $Username -NewPassword (ConvertTo-SecureString $NewPassword -AsPlainText -Force) -Reset -EA Stop
         Set-ADUser -Identity $Username -ChangePasswordAtLogon $true -EA Stop
         $result.Success=$true
-    } catch [System.UnauthorizedAccessException] { $result.Error="Access denied — no permission to reset this password."
+    } catch [System.UnauthorizedAccessException] { $result.Error="Access denied - no permission to reset this password."
     } catch { $result.Error="Reset failed: $($_.Exception.Message)" }
     return $result
 }
@@ -120,8 +151,10 @@ function Invoke-PasswordReset {
 function Invoke-AccountUnlock {
     param([string]$Username)
     $result = @{ Success=$false; Error="" }
+    $ad = Test-ADConnectivity
+    if (-not $ad.Ready) { $result.Error=$ad.Error; return $result }
     try { Unlock-ADAccount -Identity $Username -EA Stop; $result.Success=$true
-    } catch [System.UnauthorizedAccessException] { $result.Error="Access denied — no permission to unlock this account."
+    } catch [System.UnauthorizedAccessException] { $result.Error="Access denied - no permission to unlock this account."
     } catch { $result.Error="Unlock failed: $($_.Exception.Message)" }
     return $result
 }
@@ -129,7 +162,7 @@ function Invoke-AccountUnlock {
 function Format-DateOrNever {
     param($Value)
     if ($null -eq $Value) { return "Never" }
-    try { return ([datetime]$Value).ToString("MM/dd/yyyy  h:mm tt") } catch { return "—" }
+    try { return ([datetime]$Value).ToString("MM/dd/yyyy  h:mm tt") } catch { return "-" }
 }
 
 function Get-OUFromDN {
@@ -139,7 +172,7 @@ function Get-OUFromDN {
     return $DN
 }
 
-# ── THEME ─────────────────────────────────────────────────────────────────────
+# -- THEME ---------------------------------------------------------------------
 $C = @{
     Bg          = [System.Drawing.Color]::FromArgb(15,  20,  30)
     Panel       = [System.Drawing.Color]::FromArgb(22,  30,  45)
@@ -171,7 +204,7 @@ $F = @{
     MonoLog = New-Object System.Drawing.Font("Consolas",8.5)
 }
 
-# ── FORM ──────────────────────────────────────────────────────────────────────
+# -- FORM ----------------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
 $form.Text            = "RVC ADTools"
 $form.Size            = New-Object System.Drawing.Size(920, 740)
@@ -188,7 +221,7 @@ $pnlHeader.Dock=      "Top"; $pnlHeader.Height=50; $pnlHeader.BackColor=$C.Panel
 $form.Controls.Add($pnlHeader)
 
 $lblAppTitle = New-Object System.Windows.Forms.Label
-$lblAppTitle.Text="  🛡  RVC ADTools"; $lblAppTitle.Font=$F.Title
+$lblAppTitle.Text="RVC ADTools"; $lblAppTitle.Font=$F.Title
 $lblAppTitle.ForeColor=$C.TextPrimary; $lblAppTitle.AutoSize=$true
 $lblAppTitle.Location=New-Object System.Drawing.Point(8,12)
 $pnlHeader.Controls.Add($lblAppTitle)
@@ -229,7 +262,7 @@ function Set-Status {
     $lblStatus.Text=$Msg
 }
 
-# ── TABS ──────────────────────────────────────────────────────────────────────
+# -- TABS ----------------------------------------------------------------------
 $tabs = New-Object System.Windows.Forms.TabControl
 $tabs.Dock="Fill"; $tabs.Font=$F.Heading
 $tabs.DrawMode="OwnerDrawFixed"
@@ -250,17 +283,17 @@ $tabs.Add_DrawItem({
     $e.Graphics.DrawString($tab.Text,$F.Heading,(New-Object System.Drawing.SolidBrush($fg)),[System.Drawing.RectangleF]$e.Bounds,$sf)
 })
 
-$tabUser    = New-Object System.Windows.Forms.TabPage; $tabUser.Text="👤  User"
+$tabUser    = New-Object System.Windows.Forms.TabPage; $tabUser.Text="User"
 $tabUser.BackColor=$C.Bg; $tabUser.ForeColor=$C.TextPrimary
 $tabs.TabPages.Add($tabUser)
 
-$tabLockout = New-Object System.Windows.Forms.TabPage; $tabLockout.Text="🔒  Lockout Diagnostics"
+$tabLockout = New-Object System.Windows.Forms.TabPage; $tabLockout.Text="Lockout Diagnostics"
 $tabLockout.BackColor=$C.Bg; $tabLockout.ForeColor=$C.TextPrimary
 $tabs.TabPages.Add($tabLockout)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — USER
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# TAB 1 - USER
+# ==============================================================================
 
 $pnlUserSearch = New-Object System.Windows.Forms.Panel
 $pnlUserSearch.Dock="Top"; $pnlUserSearch.Height=50; $pnlUserSearch.BackColor=$C.Bg
@@ -320,11 +353,11 @@ function New-Card {
 
 # Identity
 $cId = New-Card $pnlUL "Identity" 0 155
-$lblDN   = New-Lbl $cId "—" (New-Object System.Drawing.Font("Segoe UI",15,[System.Drawing.FontStyle]::Bold)) $C.TextPrimary 14 28
+$lblDN   = New-Lbl $cId "-" (New-Object System.Drawing.Font("Segoe UI",15,[System.Drawing.FontStyle]::Bold)) $C.TextPrimary 14 28
 $lblDN.Size=New-Object System.Drawing.Size(360,30)
-$lblUN2  = New-Lbl $cId "—" $F.MonoSm $C.Accent 14 62
-$lblMail = New-Lbl $cId "—" $F.Small $C.TextMuted 14 82
-$lblDept = New-Lbl $cId "—" $F.Small $C.TextMuted 14 100
+$lblUN2  = New-Lbl $cId "-" $F.MonoSm $C.Accent 14 62
+$lblMail = New-Lbl $cId "-" $F.Small $C.TextMuted 14 82
+$lblDept = New-Lbl $cId "-" $F.Small $C.TextMuted 14 100
 $lblStat = New-Lbl $cId "" $F.Heading $C.TextDim 14 124
 $lblLock = New-Lbl $cId "" $F.Heading $C.Danger 120 124
 
@@ -332,7 +365,7 @@ $lblLock = New-Lbl $cId "" $F.Heading $C.Danger 120 124
 $cDet = New-Card $pnlUL "Account Details" 163 215
 function New-DR { param($card,$lbl,$y)
     New-Lbl $card $lbl $F.Small $C.TextDim 14 $y | Out-Null
-    $v=New-Lbl $card "—" $F.Small $C.TextPrimary 158 $y; $v.Size=New-Object System.Drawing.Size(220,16); return $v }
+    $v=New-Lbl $card "-" $F.Small $C.TextPrimary 158 $y; $v.Size=New-Object System.Drawing.Size(220,16); return $v }
 $vCreated = New-DR $cDet "Created"            28
 $vLogon   = New-DR $cDet "Last Logon"         50
 $vPwdSet  = New-DR $cDet "Password Last Set"  72
@@ -345,7 +378,7 @@ $vOU      = New-DR $cDet "OU"                 160
 $cPwd = New-Card $pnlUL "Password Reset" 386 150
 New-Lbl $cPwd "Temporary Password" $F.Heading $C.TextMuted 14 28 | Out-Null
 $txtPwd    = New-Txt   $cPwd 14 48 212 $F.Mono
-$btnGenPwd = New-Btn   $cPwd "↺ New" $F.Small $C.Card $C.Accent 234 48 56 24 $false
+$btnGenPwd = New-Btn   $cPwd "New" $F.Small $C.Card $C.Accent 234 48 56 24 $false
 $btnGenPwd.FlatAppearance.BorderColor=$C.Border; $btnGenPwd.FlatAppearance.BorderSize=1
 $btnCpyPwd = New-Btn   $cPwd "Copy" $F.Small $C.Card $C.TextMuted 298 48 52 24 $false
 $btnCpyPwd.FlatAppearance.BorderColor=$C.Border; $btnCpyPwd.FlatAppearance.BorderSize=1
@@ -355,7 +388,7 @@ $chkShow.Checked=$true; $chkShow.Location=New-Object System.Drawing.Point(14,80)
 $chkShow.FlatStyle="Flat"; $cPwd.Controls.Add($chkShow)
 $btnRstPwd = New-Btn   $cPwd "Reset Password" $F.Heading $C.Accent ([System.Drawing.Color]::White) 14 106 344 32 $false
 
-# Right — Groups
+# Right - Groups
 $cGrp = New-Card $pnlUR "Group Memberships" 0 395
 $lstGroups = New-Object System.Windows.Forms.ListBox
 $lstGroups.Dock="None"; $lstGroups.Size=New-Object System.Drawing.Size(410,358)
@@ -364,24 +397,24 @@ $lstGroups.BackColor=$C.InputBg; $lstGroups.ForeColor=$C.TextPrimary
 $lstGroups.BorderStyle="None"; $lstGroups.Font=$F.MonoSm; $lstGroups.Anchor="Top,Left,Right,Bottom"
 $cGrp.Controls.Add($lstGroups)
 
-# Right — Actions
+# Right - Actions
 $cAct = New-Card $pnlUR "Actions" 403 84
-$btnUnlock  = New-Btn $cAct "🔓 Unlock Account"    $F.Heading $C.Card $C.Warning  14  30 180 34 $false
+$btnUnlock  = New-Btn $cAct "Unlock Account"    $F.Heading $C.Card $C.Warning  14  30 180 34 $false
 $btnUnlock.FlatAppearance.BorderColor=$C.Warning; $btnUnlock.FlatAppearance.BorderSize=1
-$btnRefresh = New-Btn $cAct "↻ Refresh"             $F.Heading $C.Card $C.TextMuted 206 30 110 34 $false
+$btnRefresh = New-Btn $cAct "Refresh"             $F.Heading $C.Card $C.TextMuted 206 30 110 34 $false
 $btnRefresh.FlatAppearance.BorderColor=$C.Border; $btnRefresh.FlatAppearance.BorderSize=1
-$btnDiag    = New-Btn $cAct "🔍 Diagnose Lockout"   $F.Heading $C.Card $C.Danger   330 30 180 34 $false
+$btnDiag    = New-Btn $cAct "Diagnose Lockout"   $F.Heading $C.Card $C.Danger   330 30 180 34 $false
 $btnDiag.FlatAppearance.BorderColor=$C.Danger; $btnDiag.FlatAppearance.BorderSize=1
 $btnDiag.Visible=$false
 
-# ── USER TAB LOGIC ────────────────────────────────────────────────────────────
+# -- USER TAB LOGIC ------------------------------------------------------------
 $script:CurUser=$null; $script:CurGroups=@()
 
 function Clear-UDisplay {
-    $lblDN.Text="—"; $lblUN2.Text="—"; $lblMail.Text="—"; $lblDept.Text="—"
+    $lblDN.Text="-"; $lblUN2.Text="-"; $lblMail.Text="-"; $lblDept.Text="-"
     $lblStat.Text=""; $lblLock.Text=""
-    $vCreated.Text="—"; $vLogon.Text="—"; $vPwdSet.Text="—"; $vPwdExp.Text="—"
-    $vNvrExp.Text="—"; $vCantChg.Text="—"; $vOU.Text="—"
+    $vCreated.Text="-"; $vLogon.Text="-"; $vPwdSet.Text="-"; $vPwdExp.Text="-"
+    $vNvrExp.Text="-"; $vCantChg.Text="-"; $vOU.Text="-"
     $lstGroups.Items.Clear(); $txtPwd.Text=""
     $btnRstPwd.Enabled=$false; $btnGenPwd.Enabled=$false; $btnCpyPwd.Enabled=$false
     $btnUnlock.Enabled=$false; $btnRefresh.Enabled=$false; $btnDiag.Visible=$false
@@ -393,11 +426,11 @@ function Show-UData { param($User,$Groups)
     $lblUN2.Text = $User.SamAccountName
     $lblMail.Text= if($User.EmailAddress){$User.EmailAddress}else{"No email on file"}
     $dp=@(); if($User.Title){$dp+=$User.Title}; if($User.Department){$dp+=$User.Department}
-    $lblDept.Text= if($dp){$dp -join "  ·  "}else{"No dept/title on file"}
-    if($User.Enabled){ $lblStat.Text="● ACTIVE";    $lblStat.ForeColor=$C.Success }
-    else             { $lblStat.Text="● DISABLED";  $lblStat.ForeColor=$C.Danger  }
+    $lblDept.Text= if($dp){$dp -join "  |  "}else{"No dept/title on file"}
+    if($User.Enabled){ $lblStat.Text="* ACTIVE";    $lblStat.ForeColor=$C.Success }
+    else             { $lblStat.Text="* DISABLED";  $lblStat.ForeColor=$C.Danger  }
     if($User.LockedOut){
-        $lblLock.Text="  🔒 LOCKED OUT"; $btnUnlock.Enabled=$true; $btnDiag.Visible=$true
+        $lblLock.Text="LOCKED OUT"; $btnUnlock.Enabled=$true; $btnDiag.Visible=$true
     } else { $lblLock.Text=""; $btnUnlock.Enabled=$false; $btnDiag.Visible=$false }
     $vCreated.Text= Format-DateOrNever $User.Created
     $vLogon.Text  = Format-DateOrNever $User.LastLogonDate
@@ -411,11 +444,11 @@ function Show-UData { param($User,$Groups)
                 $exp=$User.PasswordLastSet+$pol.MaxPasswordAge; $d=($exp-(Get-Date)).Days
                 $vPwdExp.Text=$exp.ToString("MM/dd/yyyy")+"  ($d days)"
                 $vPwdExp.ForeColor=if($d -le 14){$C.Warning}else{$C.TextPrimary}
-            } else { $vPwdExp.Text="—"; $vPwdExp.ForeColor=$C.TextPrimary }
-        } catch { $vPwdExp.Text="—"; $vPwdExp.ForeColor=$C.TextPrimary }
+            } else { $vPwdExp.Text="-"; $vPwdExp.ForeColor=$C.TextPrimary }
+        } catch { $vPwdExp.Text="-"; $vPwdExp.ForeColor=$C.TextPrimary }
     }
     $vNvrExp.Text  = if($User.PasswordNeverExpires){"Yes"}else{"No"}
-    $vCantChg.Text = if($User.CannotChangePassword) {"Yes ⚠"}else{"No"}
+    $vCantChg.Text = if($User.CannotChangePassword) {"Yes (blocked)"}else{"No"}
     $vCantChg.ForeColor=if($User.CannotChangePassword){$C.Warning}else{$C.TextPrimary}
     $vOU.Text = Get-OUFromDN $User.DistinguishedName
     $lstGroups.Items.Clear()
@@ -425,7 +458,7 @@ function Show-UData { param($User,$Groups)
     $btnRstPwd.Enabled=$can; $btnGenPwd.Enabled=$can; $btnCpyPwd.Enabled=$can
     $btnRefresh.Enabled=$true
     if($can){ $txtPwd.Text=New-TempPassword }
-    if(-not $can){ Set-Status "⚠ 'User cannot change password' is set — clear this in AD first." "warning" }
+    if(-not $can){ Set-Status "User cannot change password is set - clear this in AD first." "warning" }
 }
 
 function Invoke-USearch {
@@ -437,7 +470,7 @@ function Invoke-USearch {
     if(-not $r.Success){ Set-Status $r.Error "error"; $lblUserStatus.Text=$r.Error; return }
     $script:CurUser=$r.User; $script:CurGroups=$r.Groups
     Show-UData -User $r.User -Groups $r.Groups
-    $lblUserStatus.Text=""; Set-Status "Loaded: $($r.User.DisplayName)  ·  $($r.Groups.Count) group(s)" "success"
+    $lblUserStatus.Text=""; Set-Status "Loaded: $($r.User.DisplayName)  |  $($r.Groups.Count) group(s)" "success"
 }
 
 $btnUserSearch.Add_Click({ Invoke-USearch })
@@ -458,7 +491,7 @@ $btnRstPwd.Add_Click({
     $btnRstPwd.Enabled=$false; Set-Status "Resetting password for $u..." "info"
     $r=Invoke-PasswordReset -Username $u -NewPassword $p
     if($r.Success){
-        Set-Status "✔ Password reset for $($script:CurUser.DisplayName)." "success"
+        Set-Status "Password reset for $($script:CurUser.DisplayName)." "success"
         [System.Windows.Forms.MessageBox]::Show(
             "Password reset successfully.`n`nUsername:        $u`nTemp Password:  $p`n`nUser will be prompted to change on first sign-in.",
             "Reset Complete",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information)|Out-Null
@@ -475,19 +508,19 @@ $btnUnlock.Add_Click({
     $btnUnlock.Enabled=$false; Set-Status "Unlocking $u..." "info"
     $r=Invoke-AccountUnlock -Username $u
     if($r.Success){
-        Set-Status "✔ Account unlocked for $($script:CurUser.DisplayName)." "success"
+        Set-Status "Account unlocked for $($script:CurUser.DisplayName)." "success"
         $lblLock.Text=""; $btnDiag.Visible=$false
     } else { Set-Status $r.Error "error"; $btnUnlock.Enabled=$true }
 })
 
-# Diagnose button — prefill lockout tab and switch to it
+# Diagnose button - prefill lockout tab and switch to it
 $btnDiag.Add_Click({
     if($script:CurUser){ $txtLockoutUser.Text=$script:CurUser.SamAccountName; $tabs.SelectedTab=$tabLockout }
 })
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — LOCKOUT DIAGNOSTICS
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# TAB 2 - LOCKOUT DIAGNOSTICS
+# ==============================================================================
 
 $pnlLkCtrl = New-Object System.Windows.Forms.Panel
 $pnlLkCtrl.Dock="Top"; $pnlLkCtrl.Height=54; $pnlLkCtrl.BackColor=$C.Bg
@@ -503,13 +536,13 @@ $numHours.Minimum=1; $numHours.Maximum=168; $numHours.Value=24
 $numHours.BackColor=$C.InputBg; $numHours.ForeColor=$C.TextPrimary; $numHours.Font=$F.Mono
 $pnlLkCtrl.Controls.Add($numHours)
 
-$btnRunDiag = New-Btn $pnlLkCtrl "▶  Run Diagnostics" $F.Heading $C.Accent ([System.Drawing.Color]::White) 736 14 162 28
+$btnRunDiag = New-Btn $pnlLkCtrl "Run Diagnostics" $F.Heading $C.Accent ([System.Drawing.Color]::White) 736 14 162 28
 
 $pnlLkAct = New-Object System.Windows.Forms.Panel
 $pnlLkAct.Dock="Top"; $pnlLkAct.Height=34; $pnlLkAct.BackColor=$C.Bg
 $tabLockout.Controls.Add($pnlLkAct)
 
-$btnExport = New-Btn $pnlLkAct "💾 Export CSV" $F.Small $C.Card $C.TextMuted 12 4 120 26 $false
+$btnExport = New-Btn $pnlLkAct "Export CSV" $F.Small $C.Card $C.TextMuted 12 4 120 26 $false
 $btnExport.FlatAppearance.BorderColor=$C.Border; $btnExport.FlatAppearance.BorderSize=1
 $btnClrLog = New-Btn $pnlLkAct "Clear"         $F.Small $C.Card $C.TextDim  140 4  70 26
 $btnClrLog.FlatAppearance.BorderColor=$C.Border; $btnClrLog.FlatAppearance.BorderSize=1
@@ -540,11 +573,18 @@ $btnRunDiag.Add_Click({
         Write-Log $nameCheck.Error "error"
         return
     }
+    $ad = Test-ADConnectivity
+    if (-not $ad.Ready) {
+        Set-Status $ad.Error "error"
+        Write-Log $ad.Error "error"
+        return
+    }
     $btnRunDiag.Enabled=$false; Set-Status "Running lockout diagnostics for $sam..." "info"
     $hrs=[int]$numHours.Value
 
     $job=Start-Job -ScriptBlock {
         param($sam,$hrs)
+        $Env:ADPS_LoadDefaultDrive = '0'
         Import-Module ActiveDirectory -EA Stop
         $out=New-Object System.Collections.Generic.List[object]
         $res=New-Object System.Collections.Generic.List[object]
@@ -554,7 +594,7 @@ $btnRunDiag.Add_Click({
         try{$pdc=(Get-ADDomain).PDCEmulator}catch{L "ERROR: Could not get PDC: $_" "error";return @{O=$out;R=$res}}
         try{$dcs=(Get-ADDomainController -Filter *).HostName}catch{L "ERROR: Could not enumerate DCs: $_" "error";return @{O=$out;R=$res}}
 
-        L "RVC ADTools — Lockout Diagnostics" "heading"
+        L "RVC ADTools - Lockout Diagnostics" "heading"
         L "Started:    $(Get-Date -Format 'MM/dd/yyyy h:mm tt')" "muted"
         L "Hours back: $hrs" "muted"
         L "PDC:        $pdc" "label"
@@ -565,7 +605,7 @@ $btnRunDiag.Add_Click({
         $iso=$since.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 
         foreach($u in $samList){
-            L "" "normal"; L ("═"*72) "heading"; L "  USER: $u" "heading"; L ("═"*72) "heading"
+            L "" "normal"; L ("="*72) "heading"; L "  USER: $u" "heading"; L ("="*72) "heading"
 
             # Per-DC state
             L "" "normal"; L "[ Per-DC State ]" "label"
@@ -577,15 +617,15 @@ $btnRunDiag.Add_Click({
                     $ls=if($a.LockedOut){"LOCKED"}else{"OK     "}
                     $lc=if($a.LockedOut){"error"}else{"success"}
                     L ("  {0,-42} {1}   BadPwd:{2,3}   LastBad: {3}" -f $dc,$ls,$a.badPwdCount,$(if($a.LastBadPasswordAttempt){$a.LastBadPasswordAttempt.ToString("MM/dd HH:mm:ss")}else{"never"})) $lc
-                }catch{ L "  WARNING: Could not query $dc — $_" "warn" }
+                }catch{ L "  WARNING: Could not query $dc - $_" "warn" }
             }
             $orig=$dcState|Where-Object{$_.LockTime}|Sort-Object LockTime -Desc|Select-Object -First 1
             L "" "normal"
-            if($orig){L "  ► Originating DC: $($orig.DC)  (lockout at $($orig.LockTime))" "warn"}
-            else     {L "  ► No LockoutTime on any DC — may not be currently locked." "muted"}
+            if($orig){L "  > Originating DC: $($orig.DC)  (lockout at $($orig.LockTime))" "warn"}
+            else     {L "  > No LockoutTime on any DC - may not be currently locked." "muted"}
 
             # 4740
-            L "" "normal"; L "[ Event 4740 — Account Locked Out — PDC: $pdc ]" "label"
+            L "" "normal"; L "[ Event 4740 - Account Locked Out - PDC: $pdc ]" "label"
             $x40="*[System[EventID=4740 and TimeCreated[@SystemTime>='$iso']] and EventData[Data[@Name='TargetUserName']='$u']]"
             try{$e40=Get-WinEvent -ComputerName $pdc -LogName Security -FilterXPath $x40 -EA Stop}
             catch{$e40=@(); if($_.Exception.Message -notmatch 'No events'){L "  WARNING: $($_)" "warn"}}
@@ -600,7 +640,7 @@ $btnRunDiag.Add_Click({
             # 4625
             $srcs=@($pdc); if($orig -and $orig.DC -ne $pdc){$srcs+=$orig.DC}
             foreach($src in $srcs){
-                L "" "normal"; L "[ Event 4625 — Failed Logon — $src ]" "label"
+                L "" "normal"; L "[ Event 4625 - Failed Logon - $src ]" "label"
                 $x25="*[System[EventID=4625 and TimeCreated[@SystemTime>='$iso']] and EventData[Data[@Name='TargetUserName']='$u']]"
                 try{$e25=Get-WinEvent -ComputerName $src -LogName Security -FilterXPath $x25 -EA Stop}
                 catch{$e25=@(); if($_.Exception.Message -notmatch 'No events'){L "  WARNING: $($_)" "warn"}}
@@ -616,12 +656,12 @@ $btnRunDiag.Add_Click({
             }
         }
 
-        L "" "normal"; L ("─"*72) "muted"
-        L "Complete — $($res.Count) event(s) collected." "success"
+        L "" "normal"; L ("-"*72) "muted"
+        L "Complete - $($res.Count) event(s) collected." "success"
         L "" "normal"; L "Hints:" "label"
-        L "  CallerComputer — the machine submitting bad credentials." "muted"
-        L "  Advapi process  — likely a service or scheduled task." "muted"
-        L "  NtLmSsp/Kerberos — interactive or network logon." "muted"
+        L "  CallerComputer - the machine submitting bad credentials." "muted"
+        L "  Advapi process  - likely a service or scheduled task." "muted"
+        L "  NtLmSsp/Kerberos - interactive or network logon." "muted"
         L "  Substatus 0xC000006A=wrong pwd  0xC0000064=bad username  0xC0000234=already locked" "muted"
         return @{O=$out;R=$res}
     } -ArgumentList $sam,$hrs
@@ -636,7 +676,7 @@ $btnRunDiag.Add_Click({
             if($d -and $d.R){ foreach($r in $d.R){ $script:DiagResults.Add($r) } }
             if($script:DiagResults.Count -gt 0){ $btnExport.Enabled=$true }
             $btnRunDiag.Enabled=$true
-            Set-Status "Diagnostics complete — $($script:DiagResults.Count) event(s) collected." "success"
+            Set-Status "Diagnostics complete - $($script:DiagResults.Count) event(s) collected." "success"
         }
     })
     $pt.Start()
@@ -654,7 +694,16 @@ $btnExport.Add_Click({
     }
 })
 
-$form.Add_Shown({ $txtUserSearch.Focus() })
+$form.Add_Shown({
+    $txtUserSearch.Focus()
+    $ad = Ensure-ADModule
+    if (-not $ad.Ready) {
+        Set-Status $ad.Error "warning"
+        return
+    }
+    $conn = Test-ADConnectivity -Quiet
+    if (-not $conn.Ready) { Set-Status $conn.Error "warning" }
+})
 
-# ── RUN ───────────────────────────────────────────────────────────────────────
+# -- RUN -----------------------------------------------------------------------
 [System.Windows.Forms.Application]::Run($form)
