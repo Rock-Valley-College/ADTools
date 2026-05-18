@@ -21,13 +21,13 @@
       (Domain Admin or delegated Event Log Reader on DCs)
 
 .NOTES
-    Version:  2.1.1
+    Version:  2.1.2
     GitHub:   https://github.com/Rock-Valley-College/ADTools
     Releases: https://github.com/Rock-Valley-College/ADTools/releases
 #>
 
 # -- VERSION -------------------------------------------------------------------
-$SCRIPT_VERSION = "2.1.1"
+$SCRIPT_VERSION = "2.1.2"
 $REPO_URL      = "https://github.com/Rock-Valley-College/ADTools"
 $RELEASES_URL  = "$REPO_URL/releases"
 
@@ -300,9 +300,9 @@ $pnlUserSearch.Dock="Top"; $pnlUserSearch.Height=50; $pnlUserSearch.BackColor=$C
 $tabUser.Controls.Add($pnlUserSearch)
 
 function New-Lbl { param($parent,$text,$font,$color,$x,$y,$autosize=$true)
-    $l=New-Object System.Windows.Forms.Label; $l.Text=$text; $l.Font=$font
-    $l.ForeColor=$color; $l.AutoSize=$autosize; $l.Location=New-Object System.Drawing.Point($x,$y)
-    $parent.Controls.Add($l); return $l }
+    $lblCtrl=New-Object System.Windows.Forms.Label; $lblCtrl.Text=$text; $lblCtrl.Font=$font
+    $lblCtrl.ForeColor=$color; $lblCtrl.AutoSize=$autosize; $lblCtrl.Location=New-Object System.Drawing.Point($x,$y)
+    $parent.Controls.Add($lblCtrl); return $lblCtrl }
 function New-Btn { param($parent,$text,$font,$bg,$fg,$x,$y,$w,$h,[bool]$enabled=$true)
     $b=New-Object System.Windows.Forms.Button; $b.Text=$text; $b.Font=$font
     $b.BackColor=$bg; $b.ForeColor=$fg; $b.Size=New-Object System.Drawing.Size($w,$h)
@@ -330,11 +330,11 @@ $pnlUR = New-Object System.Windows.Forms.Panel; $pnlUR.BackColor=$C.Bg
 $pnlUserContent.Controls.Add($pnlUL); $pnlUserContent.Controls.Add($pnlUR)
 
 $pnlUserContent.Add_Resize({
-    $w=$pnlUserContent.ClientSize.Width-8; $h=$pnlUserContent.ClientSize.Height-4
-    $l=[int]($w*0.46); $r=$w-$l-12
-    $pnlUL.Size=New-Object System.Drawing.Size($l,$h)
-    $pnlUR.Location=New-Object System.Drawing.Point($l+12,0)
-    $pnlUR.Size=New-Object System.Drawing.Size($r,$h)
+    $contentW=$pnlUserContent.ClientSize.Width-8; $contentH=$pnlUserContent.ClientSize.Height-4
+    $leftW=[int]($contentW*0.46); $rightW=$contentW-$leftW-12
+    $pnlUL.Size=New-Object System.Drawing.Size($leftW,$contentH)
+    $pnlUR.Location=New-Object System.Drawing.Point(($leftW+12),0)
+    $pnlUR.Size=New-Object System.Drawing.Size($rightW,$contentH)
 })
 # Trigger initial layout
 $pnlUL.Size=New-Object System.Drawing.Size(390,600); $pnlUL.Location=New-Object System.Drawing.Point(0,0)
@@ -672,7 +672,7 @@ $btnRunDiag.Add_Click({
             $pt.Stop()
             $d=Receive-Job $job -EA SilentlyContinue
             Remove-Job $job -EA SilentlyContinue
-            if($d -and $d.O){ foreach($l in $d.O){ Write-Log $l.Text $l.Type } }
+            if($d -and $d.O){ foreach($logLine in $d.O){ Write-Log $logLine.Text $logLine.Type } }
             if($d -and $d.R){ foreach($r in $d.R){ $script:DiagResults.Add($r) } }
             if($script:DiagResults.Count -gt 0){ $btnExport.Enabled=$true }
             $btnRunDiag.Enabled=$true
