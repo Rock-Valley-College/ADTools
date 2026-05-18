@@ -21,13 +21,13 @@
       (Domain Admin or delegated Event Log Reader on DCs)
 
 .NOTES
-    Version:  2.2.6
+    Version:  2.2.7
     GitHub:   https://github.com/Rock-Valley-College/ADTools
     Releases: https://github.com/Rock-Valley-College/ADTools/releases
 #>
 
 # -- VERSION -------------------------------------------------------------------
-$SCRIPT_VERSION = "2.2.6"
+$SCRIPT_VERSION = "2.2.7"
 $REPO_URL      = "https://github.com/Rock-Valley-College/ADTools"
 $RELEASES_URL  = "$REPO_URL/releases"
 
@@ -101,6 +101,8 @@ Add-Type -AssemblyName System.Drawing -ErrorAction Stop
 # Do not call EnableVisualStyles() - it lets Windows override our light text on dark backgrounds.
 
 $script:ADModuleReady = $false
+$script:ADSessionConnected = $false
+$script:CachedPasswordPolicy = $null
 
 function Ensure-ADModule {
     if ($script:ADModuleReady -and (Get-Module -Name ActiveDirectory)) {
@@ -115,8 +117,10 @@ function Ensure-ADModule {
     $prevDrive = $Env:ADPS_LoadDefaultDrive
     $Env:ADPS_LoadDefaultDrive = '0'
     try {
+        Write-TerminalLog 'Import-Module ActiveDirectory' 'cmd'
         Import-Module ActiveDirectory -ErrorAction Stop
         $script:ADModuleReady = $true
+        Write-TerminalLog 'Active Directory module loaded' 'ok'
         return @{ Ready=$true; Error='' }
     } catch {
         return @{ Ready=$false; Error="Could not load Active Directory module: $($_.Exception.Message)" }
@@ -127,17 +131,95 @@ function Ensure-ADModule {
 }
 
 function Test-ADConnectivity {
-    param([switch]$Quiet)
+    param([switch]$Quiet, [switch]$Force)
+    if (-not $Force -and $script:ADSessionConnected) {
+        return @{ Ready=$true; Error='' }
+    }
     $ad = Ensure-ADModule
     if (-not $ad.Ready) { return $ad }
     try {
+        Write-TerminalLog 'Get-ADDomain' 'cmd'
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
         Get-ADDomain -ErrorAction Stop | Out-Null
+        $sw.Stop()
+        Write-TerminalLog ("finished in {0:N0} ms" -f $sw.ElapsedMilliseconds) 'ok'
+        $script:ADSessionConnected = $true
         return @{ Ready=$true; Error='' }
     } catch {
+        $script:ADSessionConnected = $false
         $msg = 'Domain not reachable. Connect to your network or VPN, then try again.'
+        Write-TerminalLog $msg 'err'
         if (-not $Quiet) { return @{ Ready=$false; Error=$msg } }
         return @{ Ready=$false; Error=$msg }
     }
+}
+
+function Write-TerminalLog {
+    param(
+        [string]$Message,
+        [ValidateSet('cmd', 'info', 'ok', 'warn', 'err')][string]$Kind = 'info'
+    )
+    $ts = Get-Date -Format 'HH:mm:ss'
+    $tag = switch ($Kind) {
+        'cmd'  { 'CMD' }
+        'ok'   { ' OK' }
+        'warn' { 'WRN' }
+        'err'  { 'ERR' }
+        default { '   ' }
+    }
+    $color = switch ($Kind) {
+        'cmd'  { 'Cyan' }
+        'ok'   { 'Green' }
+        'warn' { 'Yellow' }
+        'err'  { 'Red' }
+        default { 'DarkGray' }
+    }
+    Write-Host "[$ts][$tag] $Message" -ForegroundColor $color
+}
+
+function Invoke-LoggedAd {
+    param(
+        [scriptblock]$ScriptBlock,
+        [string]$CommandLabel
+    )
+    Write-TerminalLog $CommandLabel 'cmd'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $out = & $ScriptBlock
+        $sw.Stop()
+        Write-TerminalLog ("finished in {0:N0} ms" -f $sw.ElapsedMilliseconds) 'ok'
+        return $out
+    } catch {
+        $sw.Stop()
+        Write-TerminalLog ("failed after {0:N0} ms: {1}" -f $sw.ElapsedMilliseconds, $_.Exception.Message) 'err'
+        throw
+    }
+}
+
+function Get-GroupNamesFromMemberOf {
+    param([AllowNull()][object]$MemberOf)
+    if ($null -eq $MemberOf) { return @() }
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($dn in @($MemberOf)) {
+        if ([string]::IsNullOrWhiteSpace($dn)) { continue }
+        $name = $null
+        if ($dn.StartsWith('CN=', [StringComparison]::OrdinalIgnoreCase)) {
+            $comma = $dn.IndexOf(',')
+            if ($comma -gt 3) { $name = $dn.Substring(3, $comma - 3) }
+            else { $name = $dn.Substring(3) }
+            $name = $name -replace '\\,', ',' -replace '\\"', '"'
+        }
+        if ($name) { [void]$names.Add($name) }
+    }
+    return @($names | Sort-Object -Unique)
+}
+
+function Get-DomainPasswordPolicyCached {
+    if ($script:CachedPasswordPolicy) { return $script:CachedPasswordPolicy }
+    $script:CachedPasswordPolicy = Invoke-LoggedAd {
+        Get-ADDefaultDomainPasswordPolicy -ErrorAction Stop
+    } -CommandLabel 'Get-ADDefaultDomainPasswordPolicy'
+    return $script:CachedPasswordPolicy
 }
 
 # -- HELPERS -------------------------------------------------------------------
@@ -166,17 +248,29 @@ function Get-UserAccount {
     if (-not $nameCheck.Valid) { $result.Error=$nameCheck.Error; return $result }
     $ad = Test-ADConnectivity
     if (-not $ad.Ready) { $result.Error=$ad.Error; return $result }
+    $props = @(
+        'DisplayName', 'EmailAddress', 'Department', 'Title', 'DistinguishedName', 'Enabled',
+        'LockedOut', 'CannotChangePassword', 'PasswordNeverExpires', 'PasswordLastSet',
+        'PasswordExpired', 'LastLogonDate', 'Created', 'MemberOf'
+    )
+    $userCmd = "Get-ADUser -Identity '$Username' -Properties $($props -join ',')"
     try {
-        $user = Get-ADUser -Identity $Username -Properties `
-            DisplayName,EmailAddress,Department,Title,DistinguishedName,Enabled,LockedOut,
-            CannotChangePassword,PasswordNeverExpires,PasswordLastSet,PasswordExpired,
-            LastLogonDate,Created,MemberOf -ErrorAction Stop
+        $user = Invoke-LoggedAd {
+            Get-ADUser -Identity $Username -Properties $props -ErrorAction Stop
+        } -CommandLabel $userCmd
     } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
-        $result.Error="No account found for '$Username'."; return $result
-    } catch { $result.Error="AD lookup failed: $($_.Exception.Message)"; return $result }
-    $groups = @()
-    foreach ($dn in $user.MemberOf) { try { $groups += (Get-ADGroup -Identity $dn -EA Stop).Name } catch {} }
-    $result.Success=$true; $result.User=$user; $result.Groups=($groups|Sort-Object)
+        $result.Error = "No account found for '$Username'."
+        return $result
+    } catch {
+        $result.Error = "AD lookup failed: $($_.Exception.Message)"
+        return $result
+    }
+    $memberCount = @($user.MemberOf).Count
+    Write-TerminalLog "Resolved $memberCount group name(s) from MemberOf (no per-group AD queries)" 'info'
+    $groups = Get-GroupNamesFromMemberOf -MemberOf $user.MemberOf
+    $result.Success = $true
+    $result.User = $user
+    $result.Groups = $groups
     return $result
 }
 
@@ -187,8 +281,12 @@ function Invoke-PasswordReset {
     $ad = Test-ADConnectivity
     if (-not $ad.Ready) { $result.Error=$ad.Error; return $result }
     try {
-        Set-ADAccountPassword -Identity $Username -NewPassword (ConvertTo-SecureString $NewPassword -AsPlainText -Force) -Reset -EA Stop
-        Set-ADUser -Identity $Username -ChangePasswordAtLogon $true -EA Stop
+        Invoke-LoggedAd {
+            Set-ADAccountPassword -Identity $Username -NewPassword (ConvertTo-SecureString $NewPassword -AsPlainText -Force) -Reset -ErrorAction Stop
+        } -CommandLabel "Set-ADAccountPassword -Identity '$Username' -Reset"
+        Invoke-LoggedAd {
+            Set-ADUser -Identity $Username -ChangePasswordAtLogon $true -ErrorAction Stop
+        } -CommandLabel "Set-ADUser -Identity '$Username' -ChangePasswordAtLogon `$true"
         $result.Success=$true
     } catch [System.UnauthorizedAccessException] { $result.Error="Access denied - no permission to reset this password."
     } catch { $result.Error="Reset failed: $($_.Exception.Message)" }
@@ -200,7 +298,9 @@ function Invoke-AccountUnlock {
     $result = @{ Success=$false; Error="" }
     $ad = Test-ADConnectivity
     if (-not $ad.Ready) { $result.Error=$ad.Error; return $result }
-    try { Unlock-ADAccount -Identity $Username -EA Stop; $result.Success=$true
+    try {
+        Invoke-LoggedAd { Unlock-ADAccount -Identity $Username -ErrorAction Stop } -CommandLabel "Unlock-ADAccount -Identity '$Username'"
+        $result.Success=$true
     } catch [System.UnauthorizedAccessException] { $result.Error="Access denied - no permission to unlock this account."
     } catch { $result.Error="Unlock failed: $($_.Exception.Message)" }
     return $result
@@ -547,7 +647,7 @@ function Show-UData { param($User,$Groups)
     elseif($User.PasswordExpired) { $vPwdExp.Text="EXPIRED"; $vPwdExp.ForeColor=$C.Danger  }
     else {
         try {
-            $pol=Get-ADDefaultDomainPasswordPolicy -EA Stop
+            $pol = Get-DomainPasswordPolicyCached
             if($User.PasswordLastSet -and $pol.MaxPasswordAge.TotalDays -gt 0){
                 $exp=$User.PasswordLastSet+$pol.MaxPasswordAge; $d=($exp-(Get-Date)).Days
                 $vPwdExp.Text=$exp.ToString("MM/dd/yyyy")+"  ($d days)"
@@ -573,12 +673,23 @@ function Invoke-USearch {
     $u=$txtUserSearch.Text.Trim(); if([string]::IsNullOrWhiteSpace($u)){return}
     Clear-UDisplay; Set-Status "Looking up '$u'..." "info"
     $btnUserSearch.Enabled=$false
-    $r=Get-UserAccount -Username $u
-    $btnUserSearch.Enabled=$true
-    if(-not $r.Success){ Set-Status $r.Error "error"; return }
-    $script:CurUser=$r.User; $script:CurGroups=$r.Groups
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-TerminalLog "----- Lookup: $u -----" 'info'
+    try {
+        $r = Get-UserAccount -Username $u
+    } finally {
+        $btnUserSearch.Enabled = $true
+    }
+    $sw.Stop()
+    if (-not $r.Success) {
+        Set-Status $r.Error "error"
+        Write-TerminalLog "Lookup failed for '$u'" 'err'
+        return
+    }
+    $script:CurUser = $r.User; $script:CurGroups = $r.Groups
     Show-UData -User $r.User -Groups $r.Groups
     Set-Status "Loaded: $($r.User.DisplayName)  |  $($r.Groups.Count) group(s)" "success"
+    Write-TerminalLog ("Lookup complete: $($r.Groups.Count) group(s), total {0:N0} ms" -f $sw.ElapsedMilliseconds) 'ok'
 }
 
 $btnUserSearch.Add_Click({ Invoke-USearch })
@@ -801,6 +912,8 @@ $pnlLockoutTab.Controls.Add($pnlLkCtrl)
 
 $form.Add_Shown({
     try {
+        Write-Host ''
+        Write-TerminalLog "ADTools v$SCRIPT_VERSION - run from this console to see AD commands and timings" 'info'
         $form.PerformLayout()
         if ($splitUser.Width -gt 100) {
             $splitUser.SplitterDistance=[int]($splitUser.Width*0.46)
