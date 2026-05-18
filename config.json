@@ -2,5 +2,7 @@
     "_comment": "Local ADTools settings. Edit this file next to ADTools.ps1 — loaded once at startup.",
 
     "MinPasswordLength":  16,
-    "TempPasswordLength": 16
+    "TempPasswordLength": 16,
+
+    "TempPasswordGeneratorUrl": "https://quarry.rockvalleycollege.cloud/temp-password"
 }

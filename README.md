@@ -54,9 +54,33 @@ Edit `config.json` next to the script:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `MinPasswordLength` | 16 | Minimum length for reset passwords |
-| `TempPasswordLength` | 16 | Length of generated temporary passwords |
+| `TempPasswordLength` | 16 | Length of generated temporary passwords (built-in **New** button) |
+| `TempPasswordGeneratorUrl` | [Quarry temp password](https://quarry.rockvalleycollege.cloud/temp-password) | Opens in the browser from **Friendly generator (Quarry)** on the User tab |
+
+The built-in generator meets AD complexity rules. Use the Quarry link when you want a more readable temp password for the user — copy it into the password field, then **Reset Password**.
 
 Restart the app after changing config.
+
+## Troubleshooting: temp password / cannot change password
+
+After a user lookup, **Account Details** shows fields that map to common helpdesk cases (including reports where a temp password works but change-password fails):
+
+| Field | What it means |
+|-------|----------------|
+| **Cannot Change Pwd** | AD account flag *User cannot change password*. Must be **No**. |
+| **Must Change Pwd** | *User must change password at next logon*. ADTools sets this when you use **Reset Password** here. Azure-only temp passwords may not set this on-prem. |
+| **SELF Change Pwd** | Explicit **SELF** extended right *Change Password* on the account (what Destin fixed in ADUC). **Not listed** = nothing explicit on the object (often still OK); if change fails with *Access denied*, set **Allow** on SELF. |
+
+**ADTools reset (on-prem):** `Set-ADAccountPassword -Reset` and `Set-ADUser -ChangePasswordAtLogon $true`. User should change password on a **domain-joined PC** (Ctrl+Alt+Del), not only in a browser tab that may show session errors (e.g. 50133).
+
+**Find accounts with the “cannot change” flag** (adjust search base):
+
+```powershell
+Get-ADUser -Filter 'CannotChangePassword -eq $true' -SearchBase 'OU=Students,DC=yourdomain,DC=edu' -Properties SamAccountName, DistinguishedName |
+  Select-Object SamAccountName, DistinguishedName
+```
+
+SELF permissions require per-object ACL review in ADUC or a custom audit script; ADTools checks the signed-in user on lookup.
 
 ## Publishing a new release (maintainers)
 
