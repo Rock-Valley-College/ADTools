@@ -23,28 +23,32 @@
       (Domain Admin or delegated Event Log Reader on DCs)
 
 .NOTES
-    Version:  2.0.0
+    Version:  2.1.0
     GitHub:   https://github.com/Rock-Valley-College/ADTools
-
-    irm https://raw.githubusercontent.com/Rock-Valley-College/ADTools/main/ADTools.ps1 | iex
+    Releases: https://github.com/Rock-Valley-College/ADTools/releases
 #>
 
 # ── VERSION ───────────────────────────────────────────────────────────────────
-$SCRIPT_VERSION = "2.0.0"
+$SCRIPT_VERSION = "2.1.0"
+$REPO_URL      = "https://github.com/Rock-Valley-College/ADTools"
+$RELEASES_URL  = "$REPO_URL/releases"
 
-# ── REMOTE CONFIG ─────────────────────────────────────────────────────────────
-$CONFIG_URL = "https://raw.githubusercontent.com/Rock-Valley-College/ADTools/main/config.json"
-
+# ── CONFIG (local config.json beside this script) ─────────────────────────────
 $CONFIG = @{
     MinPasswordLength  = 16
     TempPasswordLength = 16
-    UpdateCheckURL     = "https://raw.githubusercontent.com/Rock-Valley-College/ADTools/main/ADTools.ps1"
 }
 
-try {
-    $remoteConfig = Invoke-RestMethod -Uri $CONFIG_URL -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
-    foreach ($key in $remoteConfig.PSObject.Properties.Name) { $CONFIG[$key] = $remoteConfig.$key }
-} catch { }
+$configPath = Join-Path $PSScriptRoot 'config.json'
+if (Test-Path -LiteralPath $configPath) {
+    try {
+        $localConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        foreach ($key in $localConfig.PSObject.Properties.Name) {
+            if ($key -eq '_comment') { continue }
+            $CONFIG[$key] = $localConfig.$key
+        }
+    } catch { }
+}
 
 # ── BOOTSTRAP ─────────────────────────────────────────────────────────────────
 Add-Type -AssemblyName System.Windows.Forms
@@ -63,6 +67,13 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 Import-Module ActiveDirectory -ErrorAction Stop
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
+function Test-SamAccountName {
+    param([string]$Username)
+    if ([string]::IsNullOrWhiteSpace($Username)) { return @{ Valid=$false; Error="Please enter a username." } }
+    if ($Username -notmatch '^[a-zA-Z0-9._-]+$') { return @{ Valid=$false; Error="Invalid username characters." } }
+    return @{ Valid=$true; Error="" }
+}
+
 function New-TempPassword {
     $upper   = 'ABCDEFGHJKLMNPQRSTUVWXYZ'.ToCharArray()
     $lower   = 'abcdefghjkmnpqrstuvwxyz'.ToCharArray()
@@ -77,8 +88,8 @@ function New-TempPassword {
 function Get-UserAccount {
     param([string]$Username)
     $result = @{ Success=$false; User=$null; Groups=@(); Error="" }
-    if ([string]::IsNullOrWhiteSpace($Username)) { $result.Error="Please enter a username."; return $result }
-    if ($Username -notmatch '^[a-zA-Z0-9._-]+$') { $result.Error="Invalid username characters."; return $result }
+    $nameCheck = Test-SamAccountName -Username $Username
+    if (-not $nameCheck.Valid) { $result.Error=$nameCheck.Error; return $result }
     try {
         $user = Get-ADUser -Identity $Username -Properties `
             DisplayName,EmailAddress,Department,Title,DistinguishedName,Enabled,LockedOut,
@@ -198,6 +209,19 @@ $lblStatus.Text="Ready."; $lblStatus.Font=$F.Small
 $lblStatus.ForeColor=$C.TextMuted; $lblStatus.AutoSize=$true
 $lblStatus.Location=New-Object System.Drawing.Point(14,6)
 $pnlStatus.Controls.Add($lblStatus)
+
+$lnkUpdates = New-Object System.Windows.Forms.LinkLabel
+$lnkUpdates.Text="Get latest version"; $lnkUpdates.Font=$F.Small
+$lnkUpdates.LinkColor=$C.Accent; $lnkUpdates.ActiveLinkColor=$C.Accent
+$lnkUpdates.VisitedLinkColor=$C.TextMuted; $lnkUpdates.AutoSize=$true
+$lnkUpdates.Cursor=[System.Windows.Forms.Cursors]::Hand
+$lnkUpdates.Anchor="Top,Right"
+$pnlStatus.Controls.Add($lnkUpdates)
+$lnkUpdates.Add_LinkClicked({ Start-Process $RELEASES_URL })
+$pnlStatus.Add_Resize({
+    $lnkUpdates.Location=New-Object System.Drawing.Point(($pnlStatus.ClientSize.Width-$lnkUpdates.Width-14),6)
+})
+$lnkUpdates.Location=New-Object System.Drawing.Point(780,6)
 
 function Set-Status {
     param([string]$Msg,[string]$Type="info")
@@ -471,7 +495,6 @@ $tabLockout.Controls.Add($pnlLkCtrl)
 
 New-Lbl $pnlLkCtrl "Username" $F.Heading $C.TextMuted 12 18 | Out-Null
 $txtLockoutUser = New-Txt $pnlLkCtrl 98 15 200 $F.Mono
-New-Lbl $pnlLkCtrl "(blank = scan all locked accounts)" $F.Small $C.TextDim 310 19 | Out-Null
 New-Lbl $pnlLkCtrl "Hours back" $F.Heading $C.TextMuted 570 19 | Out-Null
 
 $numHours = New-Object System.Windows.Forms.NumericUpDown
@@ -510,8 +533,15 @@ $script:DiagResults = New-Object System.Collections.Generic.List[object]
 
 $btnRunDiag.Add_Click({
     $rtbLog.Clear(); $script:DiagResults.Clear(); $btnExport.Enabled=$false
-    $btnRunDiag.Enabled=$false; Set-Status "Running lockout diagnostics..." "info"
-    $sam=[string]$txtLockoutUser.Text.Trim(); $hrs=[int]$numHours.Value
+    $sam=[string]$txtLockoutUser.Text.Trim()
+    $nameCheck = Test-SamAccountName -Username $sam
+    if (-not $nameCheck.Valid) {
+        Set-Status $nameCheck.Error "error"
+        Write-Log $nameCheck.Error "error"
+        return
+    }
+    $btnRunDiag.Enabled=$false; Set-Status "Running lockout diagnostics for $sam..." "info"
+    $hrs=[int]$numHours.Value
 
     $job=Start-Job -ScriptBlock {
         param($sam,$hrs)
@@ -531,15 +561,7 @@ $btnRunDiag.Add_Click({
         L "DCs ($($dcs.Count)): $($dcs -join ', ')" "label"
         L "" "muted"
 
-        if([string]::IsNullOrWhiteSpace($sam)){
-            L "No username — scanning all locked accounts..." "warn"
-            try{
-                $locked=Search-ADAccount -LockedOut|Select-Object -Expand SamAccountName
-                if(-not $locked){L "No locked accounts found right now." "success";return @{O=$out;R=$res}}
-                $samList=$locked; L "Found $($locked.Count) locked account(s): $($locked -join ', ')" "warn"
-            }catch{L "ERROR: $($_)" "error";return @{O=$out;R=$res}}
-        } else { $samList=@($sam) }
-
+        $samList=@($sam)
         $iso=$since.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 
         foreach($u in $samList){
@@ -632,28 +654,7 @@ $btnExport.Add_Click({
     }
 })
 
-# ── UPDATE CHECK ──────────────────────────────────────────────────────────────
-$form.Add_Shown({
-    $txtUserSearch.Focus()
-    $uj=Start-Job -ScriptBlock {
-        param($url,$ver)
-        try{
-            $r=Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 6 -EA Stop
-            if($r.Content -match 'SCRIPT_VERSION\s*=\s*"(\d+\.\d+\.\d+)"'){
-                $l=$Matches[1]; if([version]$l -gt [version]$ver){return $l}
-            }
-        }catch{}; return $null
-    } -ArgumentList $CONFIG.UpdateCheckURL,$SCRIPT_VERSION
-
-    $ut=New-Object System.Windows.Forms.Timer; $ut.Interval=600
-    $ut.Add_Tick({
-        if($uj.State -in @("Completed","Failed")){
-            $ut.Stop(); $l=Receive-Job $uj -EA SilentlyContinue; Remove-Job $uj -EA SilentlyContinue
-            if($l){ $lblVerBadge.Text="v$SCRIPT_VERSION — update available: v$l"; $lblVerBadge.ForeColor=$C.Warning }
-        }
-    })
-    $ut.Start()
-})
+$form.Add_Shown({ $txtUserSearch.Focus() })
 
 # ── RUN ───────────────────────────────────────────────────────────────────────
 [System.Windows.Forms.Application]::Run($form)
