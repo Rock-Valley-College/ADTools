@@ -1,0 +1,8 @@
+{
+    "_comment": "ADTools configuration for Rock Valley College. Edit this file to update settings — the script pulls it fresh on every launch.",
+
+    "MinPasswordLength":  16,
+    "TempPasswordLength": 16,
+
+    "UpdateCheckURL": "https://raw.githubusercontent.com/Rock-Valley-College/ADTools/main/ADTools.ps1"
+}
