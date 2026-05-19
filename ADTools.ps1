@@ -23,13 +23,13 @@
       (Domain Admin or delegated Event Log Reader on DCs)
 
 .NOTES
-    Version:  2.3.1
+    Version:  2.3.3
     GitHub:   https://github.com/Rock-Valley-College/ADTools
     Releases: https://github.com/Rock-Valley-College/ADTools/releases
 #>
 
 # -- VERSION -------------------------------------------------------------------
-$SCRIPT_VERSION = "2.3.1"
+$SCRIPT_VERSION = "2.3.3"
 $REPO_URL      = "https://github.com/Rock-Valley-College/ADTools"
 $RELEASES_URL  = "$REPO_URL/releases"
 
@@ -82,7 +82,6 @@ if ($PSCommandPath) {
 $CONFIG = @{
     MinPasswordLength         = 16
     TempPasswordLength        = 16
-    TempPasswordGeneratorUrl  = 'https://quarry.rockvalleycollege.cloud/temp-password'
 }
 
 $configPath = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'config.json' } else { $null }
@@ -473,7 +472,7 @@ function Get-UserAccount {
     $props = @(
         'DisplayName', 'EmailAddress', 'Department', 'Title', 'DistinguishedName', 'Enabled',
         'LockedOut', 'CannotChangePassword', 'PasswordNeverExpires', 'PasswordLastSet',
-        'PasswordExpired', 'LastLogonDate', 'Created', 'MemberOf'
+        'PasswordExpired', 'LastLogonDate', 'Created', 'MemberOf', 'info'
     )
     $userCmd = "Get-ADUser -Identity '$Username' -Properties $($props -join ',')"
     try {
@@ -494,6 +493,29 @@ function Get-UserAccount {
     $result.Success = $true
     $result.User = $user
     $result.Groups = $groups
+    return $result
+}
+
+function Update-UserNotes {
+    param([string]$Username, [AllowNull()][string]$Notes)
+    $result = @{ Success=$false; Error="" }
+    $nameCheck = Test-SamAccountName -Username $Username
+    if (-not $nameCheck.Valid) { $result.Error=$nameCheck.Error; return $result }
+    $ad = Test-ADConnectivity
+    if (-not $ad.Ready) { $result.Error=$ad.Error; return $result }
+    try {
+        if ([string]::IsNullOrWhiteSpace($Notes)) {
+            Invoke-LoggedAd {
+                Set-ADUser -Identity $Username -Clear info -ErrorAction Stop
+            } -CommandLabel "Set-ADUser -Identity '$Username' -Clear info"
+        } else {
+            Invoke-LoggedAd {
+                Set-ADUser -Identity $Username -Replace @{ info = $Notes } -ErrorAction Stop
+            } -CommandLabel "Set-ADUser -Identity '$Username' -Replace @{info=...}"
+        }
+        $result.Success=$true
+    } catch [System.UnauthorizedAccessException] { $result.Error="Access denied - no permission to update notes for this user."
+    } catch { $result.Error="Notes update failed: $($_.Exception.Message)" }
     return $result
 }
 
@@ -530,7 +552,7 @@ function Get-ComputerAccount {
     $props = @(
         'DNSHostName', 'IPv4Address', 'Description', 'DistinguishedName', 'Enabled',
         'OperatingSystem', 'OperatingSystemVersion', 'LastLogonDate', 'Created',
-        'Modified', 'PasswordLastSet', 'MemberOf', 'ManagedBy', 'Location'
+        'Modified', 'PasswordLastSet', 'MemberOf', 'ManagedBy', 'Location', 'info'
     )
     $computerCmd = "Get-ADComputer -Identity '$name' -Properties $($props -join ',')"
     try {
@@ -550,6 +572,30 @@ function Get-ComputerAccount {
     $result.Computer = $computer
     $result.Groups = Get-GroupNamesFromMemberOf -MemberOf $computer.MemberOf
     $result.IPAddress = Resolve-ComputerIPv4Address -Computer $computer
+    return $result
+}
+
+function Update-ComputerNotes {
+    param([string]$ComputerName, [AllowNull()][string]$Notes)
+    $result = @{ Success=$false; Error="" }
+    $nameCheck = Test-ComputerAccountName -ComputerName $ComputerName
+    if (-not $nameCheck.Valid) { $result.Error=$nameCheck.Error; return $result }
+    $ad = Test-ADConnectivity
+    if (-not $ad.Ready) { $result.Error=$ad.Error; return $result }
+    $name = $nameCheck.Name
+    try {
+        if ([string]::IsNullOrWhiteSpace($Notes)) {
+            Invoke-LoggedAd {
+                Set-ADComputer -Identity $name -Clear info -ErrorAction Stop
+            } -CommandLabel "Set-ADComputer -Identity '$name' -Clear info"
+        } else {
+            Invoke-LoggedAd {
+                Set-ADComputer -Identity $name -Replace @{ info = $Notes } -ErrorAction Stop
+            } -CommandLabel "Set-ADComputer -Identity '$name' -Replace @{info=...}"
+        }
+        $result.Success=$true
+    } catch [System.UnauthorizedAccessException] { $result.Error="Access denied - no permission to update notes for this computer."
+    } catch { $result.Error="Computer notes update failed: $($_.Exception.Message)" }
     return $result
 }
 
@@ -910,6 +956,11 @@ function Update-GroupsListHeight {
     $lstGroups.Height=[Math]::Max(120,$cGrp.ClientSize.Height-36)
 }
 
+function Update-UserNotesLayout {
+    if (-not $cUserNotes -or -not $txtUserNotes) { return }
+    $txtUserNotes.Width=[Math]::Max(100,$cUserNotes.ClientSize.Width-24)
+}
+
 function New-Lbl { param($parent,$text,$font,$color,$x,$y,$autosize=$true)
     $lblCtrl=New-Object System.Windows.Forms.Label; $lblCtrl.Text=$text; $lblCtrl.Font=$font
     $lblCtrl.AutoSize=$autosize; $lblCtrl.Location=New-Object System.Drawing.Point($x,$y)
@@ -928,6 +979,13 @@ function New-Txt { param($parent,$x,$y,$w,$font)
     $t=New-Object System.Windows.Forms.TextBox; $t.Size=New-Object System.Drawing.Size($w,26)
     $t.Location=New-Object System.Drawing.Point($x,$y); $t.BackColor=$C.InputBg
     $t.ForeColor=$C.TextPrimary; $t.BorderStyle="FixedSingle"; $t.Font=$font
+    Set-ControlDarkStyle $t $C.InputBg
+    $parent.Controls.Add($t); return $t }
+function New-Memo { param($parent,$x,$y,$w,$h)
+    $t=New-Object System.Windows.Forms.TextBox; $t.Size=New-Object System.Drawing.Size($w,$h)
+    $t.Location=New-Object System.Drawing.Point($x,$y); $t.BackColor=$C.InputBg
+    $t.ForeColor=$C.TextPrimary; $t.BorderStyle="FixedSingle"; $t.Font=$F.MonoSm
+    $t.Multiline=$true; $t.AcceptsReturn=$true; $t.ScrollBars="Vertical"; $t.Enabled=$false
     Set-ControlDarkStyle $t $C.InputBg
     $parent.Controls.Add($t); return $t }
 
@@ -986,22 +1044,8 @@ $chkShow.Checked=$true; $chkShow.Location=New-Object System.Drawing.Point(14,80)
 $chkShow.FlatStyle="Flat"; Set-ControlDarkStyle $chkShow $C.Card
 $cPwd.Controls.Add($chkShow)
 
-$lnkTempPwd = New-Object System.Windows.Forms.LinkLabel
-$lnkTempPwd.Text = "Friendly generator (Quarry)"
-$lnkTempPwd.Font = $F.Small
-$lnkTempPwd.LinkColor = $C.Accent
-$lnkTempPwd.ActiveLinkColor = $C.Accent
-$lnkTempPwd.VisitedLinkColor = $C.TextMuted
-$lnkTempPwd.AutoSize = $true
-$lnkTempPwd.Location = New-Object System.Drawing.Point(158, 82)
-Set-ControlDarkStyle $lnkTempPwd $C.Card
-$lnkTempPwd.Cursor = [System.Windows.Forms.Cursors]::Hand
-$cPwd.Controls.Add($lnkTempPwd)
-$lnkTempPwd.Add_LinkClicked({
-    param($sender, $e)
-    $e.Link.Visited = $true
-    Start-Process $CONFIG.TempPasswordGeneratorUrl
-})
+$lblTempPwdHint = New-Lbl $cPwd "The Quarry has a temp password generator for easy over the phone passwords." $F.Small $C.TextMuted 158 82 $false
+$lblTempPwdHint.Size = New-Object System.Drawing.Size(190,36)
 
 $btnRstPwd = New-Btn   $cPwd "Reset Password" $F.Heading $C.Accent ([System.Drawing.Color]::White) 14 106 344 32 $false
 
@@ -1016,6 +1060,16 @@ $lstGroups.Anchor="Top,Left,Right,Bottom"
 $cGrp.Controls.Add($lstGroups)
 $cGrp.Add_Resize({ Update-GroupsListHeight })
 $splitUser.Add_SplitterMoved({ Update-GroupsListHeight })
+
+# Right - AD Notes
+$cUserNotes = New-Card $splitUser.Panel2 "AD Notes" 178
+$txtUserNotes = New-Memo $cUserNotes 12 30 360 96
+$txtUserNotes.Anchor="Top,Left,Right"
+$btnUserSaveNotes = New-Btn $cUserNotes "Save Notes" $F.Heading $C.Bg $C.TextPrimary 12 136 130 30 $false
+$btnUserSaveNotes.FlatAppearance.BorderColor=$C.Border; $btnUserSaveNotes.FlatAppearance.BorderSize=1
+$lblUserNotesHint = New-Lbl $cUserNotes "Writes to the AD info/Notes attribute." $F.Small $C.TextMuted 154 143
+$cUserNotes.Add_Resize({ Update-UserNotesLayout })
+$splitUser.Add_SplitterMoved({ Update-UserNotesLayout })
 
 # Right - Actions
 $cAct = New-Card $splitUser.Panel2 "Actions" 84
@@ -1037,9 +1091,9 @@ function Clear-UDisplay {
     $lblStat.Text=""; $lblLock.Text=""
     $vCreated.Text="-"; $vLogon.Text="-"; $vPwdSet.Text="-"; $vPwdExp.Text="-"
     $vNvrExp.Text="-"; $vCantChg.Text="-"; $vMustChg.Text="-"; $vSelfChg.Text="-"; $vOU.Text="-"
-    $lstGroups.Items.Clear(); $txtPwd.Text=""
+    $lstGroups.Items.Clear(); $txtPwd.Text=""; $txtUserNotes.Text=""; $txtUserNotes.Enabled=$false
     $btnRstPwd.Enabled=$false; $btnGenPwd.Enabled=$false; $btnCpyPwd.Enabled=$false
-    $btnUnlock.Enabled=$false; $btnRefresh.Enabled=$false; $btnDiag.Visible=$false
+    $btnUnlock.Enabled=$false; $btnRefresh.Enabled=$false; $btnUserSaveNotes.Enabled=$false; $btnDiag.Visible=$false
     $script:CurUser=$null; $script:CurGroups=@(); $script:CurPasswordStatus=$null
 }
 
@@ -1100,10 +1154,13 @@ function Show-UData {
     $lstGroups.Items.Clear()
     if($Groups.Count -gt 0){ foreach($g in $Groups){ $lstGroups.Items.Add($g)|Out-Null } }
     else { $lstGroups.Items.Add("(no group memberships)")|Out-Null }
+    $txtUserNotes.Text = if($User.info){[string]$User.info}else{""}
+    $txtUserNotes.Enabled = $true
     $btnRstPwd.Enabled = (-not $User.CannotChangePassword)
     $btnGenPwd.Enabled = $btnRstPwd.Enabled
     $btnCpyPwd.Enabled = $btnRstPwd.Enabled
     $btnRefresh.Enabled = $true
+    $btnUserSaveNotes.Enabled = $true
     if ($btnRstPwd.Enabled) { $txtPwd.Text = New-TempPassword }
 
     if ($PasswordStatus -and $PasswordStatus.Issues.Count -gt 0) {
@@ -1144,6 +1201,22 @@ function Invoke-USearch {
 $btnUserSearch.Add_Click({ Invoke-USearch })
 $txtUserSearch.Add_KeyDown({ if($_.KeyCode -eq "Return"){ Invoke-USearch } })
 $btnRefresh.Add_Click({ if($script:CurUser){ $txtUserSearch.Text=$script:CurUser.SamAccountName; Invoke-USearch } })
+$btnUserSaveNotes.Add_Click({
+    if(-not $script:CurUser){return}
+    $u=$script:CurUser.SamAccountName
+    $notes=$txtUserNotes.Text
+    $btnUserSaveNotes.Enabled=$false
+    Set-Status "Updating AD notes for $u..." "info"
+    $r=Update-UserNotes -Username $u -Notes $notes
+    if($r.Success){
+        try { $script:CurUser.info = $notes } catch { }
+        Set-Status "AD notes updated for $u." "success"
+        $btnUserSaveNotes.Enabled=$true
+    } else {
+        Set-Status $r.Error "error"
+        $btnUserSaveNotes.Enabled=$true
+    }
+})
 $btnGenPwd.Add_Click({ $txtPwd.Text=New-TempPassword })
 $btnCpyPwd.Add_Click({ if($txtPwd.Text){ [System.Windows.Forms.Clipboard]::SetText($txtPwd.Text); Set-Status "Password copied to clipboard." "info" } })
 $chkShow.Add_CheckedChanged({ $txtPwd.UseSystemPasswordChar=-not $chkShow.Checked })
@@ -1208,6 +1281,11 @@ function Update-ComputerGroupsListHeight {
     $lstComputerGroups.Height=[Math]::Max(120,$cCompGrp.ClientSize.Height-36)
 }
 
+function Update-ComputerNotesLayout {
+    if (-not $cCompNotes -or -not $txtComputerNotes) { return }
+    $txtComputerNotes.Width=[Math]::Max(100,$cCompNotes.ClientSize.Width-24)
+}
+
 $pnlComputerTab.Controls.Add($splitComputer)
 
 New-Lbl $pnlComputerSearch "Computer" $F.Heading $C.TextPrimary 12 18 | Out-Null
@@ -1238,11 +1316,14 @@ foreach ($compValue in @($vCompOU,$vCompIP,$vCompOS,$vCompOSVer,$vCompLogon,$vCo
 }
 $vCompDN.Size = New-Object System.Drawing.Size(360,48)
 
-$cCompHelp = New-Card $splitComputer.Panel1 "Helpdesk Notes" 118
-$lblCompHint1 = New-Lbl $cCompHelp "Use OU Path to confirm the device is in the expected policy/location container." $F.Small $C.TextMuted 14 30 $false
-$lblCompHint1.Size=New-Object System.Drawing.Size(360,32)
-$lblCompHint2 = New-Lbl $cCompHelp "IP Address comes from AD/DNS and may be blank if the hostname does not resolve." $F.Small $C.TextMuted 14 64 $false
-$lblCompHint2.Size=New-Object System.Drawing.Size(360,32)
+$cCompNotes = New-Card $splitComputer.Panel1 "AD Notes" 178
+$txtComputerNotes = New-Memo $cCompNotes 12 30 360 96
+$txtComputerNotes.Anchor="Top,Left,Right"
+$btnComputerSaveNotes = New-Btn $cCompNotes "Save Notes" $F.Heading $C.Bg $C.TextPrimary 12 136 130 30 $false
+$btnComputerSaveNotes.FlatAppearance.BorderColor=$C.Border; $btnComputerSaveNotes.FlatAppearance.BorderSize=1
+$lblComputerNotesHint = New-Lbl $cCompNotes "Writes to the AD info/Notes attribute." $F.Small $C.TextMuted 154 143
+$cCompNotes.Add_Resize({ Update-ComputerNotesLayout })
+$splitComputer.Add_SplitterMoved({ Update-ComputerNotesLayout })
 
 $cCompGrp = New-Card $splitComputer.Panel2 "Computer Groups" 395
 $lstComputerGroups = New-Object System.Windows.Forms.ListBox
@@ -1270,8 +1351,9 @@ function Clear-CDisplay {
     $lblCompName.Text="-"; $lblCompDns.Text="-"; $lblCompDesc.Text="-"; $lblCompLoc.Text="-"; $lblCompStat.Text=""
     $vCompOU.Text="-"; $vCompIP.Text="-"; $vCompOS.Text="-"; $vCompOSVer.Text="-"; $vCompLogon.Text="-"
     $vCompPwdSet.Text="-"; $vCompCreated.Text="-"; $vCompChanged.Text="-"; $vCompManaged.Text="-"; $vCompDN.Text="-"
+    $txtComputerNotes.Text=""; $txtComputerNotes.Enabled=$false
     $lstComputerGroups.Items.Clear()
-    $btnComputerRefresh.Enabled=$false; $btnComputerCopy.Enabled=$false
+    $btnComputerRefresh.Enabled=$false; $btnComputerCopy.Enabled=$false; $btnComputerSaveNotes.Enabled=$false
     $script:CurComputer=$null; $script:CurComputerGroups=@(); $script:CurComputerIP=''
 }
 
@@ -1295,12 +1377,15 @@ function Show-CData {
     $vCompChanged.Text = Format-DateOrNever $Computer.Modified
     $vCompManaged.Text = if($Computer.ManagedBy){Get-NameFromDN $Computer.ManagedBy}else{"-"}
     $vCompDN.Text      = $Computer.DistinguishedName
+    $txtComputerNotes.Text = if($Computer.info){[string]$Computer.info}else{""}
+    $txtComputerNotes.Enabled = $true
 
     $lstComputerGroups.Items.Clear()
     if($Groups.Count -gt 0){ foreach($g in $Groups){ $lstComputerGroups.Items.Add($g)|Out-Null } }
     else { $lstComputerGroups.Items.Add("(no computer group memberships)")|Out-Null }
     $btnComputerRefresh.Enabled = $true
     $btnComputerCopy.Enabled = $true
+    $btnComputerSaveNotes.Enabled = $true
     Set-Status "Loaded computer: $($Computer.Name)  |  $($Groups.Count) group(s)" 'success'
 }
 
@@ -1317,6 +1402,7 @@ function Get-ComputerSummaryText {
         "Last Logon: $(Format-DateOrNever $c.LastLogonDate)"
         "Password Last Set: $(Format-DateOrNever $c.PasswordLastSet)"
         "Managed By: $(if($c.ManagedBy){Get-NameFromDN $c.ManagedBy}else{'-'})"
+        "Notes: $($txtComputerNotes.Text)"
     ) -join "`r`n"
 }
 
@@ -1347,6 +1433,22 @@ function Invoke-CSearch {
 $btnComputerSearch.Add_Click({ Invoke-CSearch })
 $txtComputerSearch.Add_KeyDown({ if($_.KeyCode -eq "Return"){ Invoke-CSearch } })
 $btnComputerRefresh.Add_Click({ if($script:CurComputer){ $txtComputerSearch.Text=$script:CurComputer.Name; Invoke-CSearch } })
+$btnComputerSaveNotes.Add_Click({
+    if(-not $script:CurComputer){return}
+    $name=$script:CurComputer.Name
+    $notes=$txtComputerNotes.Text
+    $btnComputerSaveNotes.Enabled=$false
+    Set-Status "Updating AD notes for $name..." "info"
+    $r=Update-ComputerNotes -ComputerName $name -Notes $notes
+    if($r.Success){
+        try { $script:CurComputer.info = $notes } catch { }
+        Set-Status "AD notes updated for $name." "success"
+        $btnComputerSaveNotes.Enabled=$true
+    } else {
+        Set-Status $r.Error "error"
+        $btnComputerSaveNotes.Enabled=$true
+    }
+})
 $btnComputerCopy.Add_Click({
     $summary = Get-ComputerSummaryText
     if($summary){ [System.Windows.Forms.Clipboard]::SetText($summary); Set-Status "Computer summary copied to clipboard." "info" }
@@ -1461,7 +1563,9 @@ $form.Add_Shown({
             $splitComputer.SplitterDistance=[int]($splitComputer.Width*0.46)
         }
         Update-GroupsListHeight
+        Update-UserNotesLayout
         Update-ComputerGroupsListHeight
+        Update-ComputerNotesLayout
         $txtUserSearch.Focus()
         $ad = Ensure-ADModule
         if (-not $ad.Ready) {

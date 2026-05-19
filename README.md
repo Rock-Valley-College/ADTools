@@ -1,6 +1,6 @@
 # ADTools
 
-PowerShell GUI for on-premises Active Directory helpdesk tasks: user lookup, computer lookup, password reset, account unlock, and lockout diagnostics.
+PowerShell GUI for on-premises Active Directory helpdesk tasks: user lookup, computer lookup, AD notes, password reset, account unlock, and lockout diagnostics.
 
 **Repository:** [github.com/Rock-Valley-College/ADTools](https://github.com/Rock-Valley-College/ADTools)
 
@@ -18,7 +18,7 @@ Get the latest packaged copy from **[Releases](https://github.com/Rock-Valley-Co
 - Domain-joined Windows PC
 - PowerShell 5.1 or later
 - RSAT **Active Directory** module (`Rsat.ActiveDirectory.DS-LDS.Tools`)
-- AD rights to manage target users (delegation applies)
+- AD rights to manage target users/computers and update notes where needed (delegation applies)
 - Security event log read access on DCs for lockout diagnostics (Domain Admin or delegated Event Log Reader)
 
 Install RSAT (elevated PowerShell):
@@ -61,6 +61,10 @@ The **Computer** tab helps helpdesk staff quickly verify an AD computer object. 
 
 It shows OU path, DNS hostname, IP address from AD/DNS, operating system, last logon, password last set, managed-by, description/location, and computer group memberships. Use **Copy Summary** to paste the key details into a ticket.
 
+## AD notes
+
+The **User** and **Computer** tabs can view and update the object's AD **Notes** field (`info` attribute). Use it for helpdesk context such as known lockout causes, stale device notes, or ticket references. The existing **Refresh** buttons pull the latest values back from AD.
+
 ## Configuration
 
 Edit `config.json` next to the script:
@@ -69,9 +73,8 @@ Edit `config.json` next to the script:
 |---------|---------|-------------|
 | `MinPasswordLength` | 16 | Minimum length for reset passwords |
 | `TempPasswordLength` | 16 | Length of generated temporary passwords (built-in **New** button) |
-| `TempPasswordGeneratorUrl` | [Quarry temp password](https://quarry.rockvalleycollege.cloud/temp-password) | Opens in the browser from **Friendly generator (Quarry)** on the User tab |
 
-The built-in generator meets AD complexity rules. Use the Quarry link when you want a more readable temp password for the user — copy it into the password field, then **Reset Password**.
+The built-in generator meets AD complexity rules. The Quarry has a temp password generator for easy over the phone passwords; copy one into the password field, then **Reset Password**.
 
 Restart the app after changing config.
 
