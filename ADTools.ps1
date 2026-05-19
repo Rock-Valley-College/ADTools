@@ -451,6 +451,35 @@ function Test-ComputerAccountName {
     return @{ Valid=$true; Name=$clean; Error="" }
 }
 
+function Get-CurrentOperatorName {
+    try {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($identity -and -not [string]::IsNullOrWhiteSpace($identity.Name)) { return $identity.Name }
+    } catch { }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:USERDOMAIN) -and -not [string]::IsNullOrWhiteSpace($env:USERNAME)) {
+        return "$env:USERDOMAIN\$env:USERNAME"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:USERNAME)) { return $env:USERNAME }
+    return 'unknown user'
+}
+
+function New-StampedAdNotes {
+    param([AllowNull()][string]$Notes)
+    if ([string]::IsNullOrWhiteSpace($Notes)) { return '' }
+
+    $stamp = "Notes last updated by {0} on {1}" -f (Get-CurrentOperatorName), (Get-Date -Format 'yyyy-MM-dd')
+    $body = $Notes.Trim()
+    $lines = @($body -split "\r?\n")
+    if ($lines.Count -gt 0 -and $lines[0].Trim() -match '^Notes last updated by .+ on \d{4}-\d{2}-\d{2}$') {
+        $remaining = @($lines | Select-Object -Skip 1)
+        if ($remaining.Count -gt 0) { return @($stamp) + $remaining -join "`r`n" }
+        return $stamp
+    }
+
+    return @($stamp, $body) -join "`r`n"
+}
+
 function New-TempPassword {
     $upper   = 'ABCDEFGHJKLMNPQRSTUVWXYZ'.ToCharArray()
     $lower   = 'abcdefghjkmnpqrstuvwxyz'.ToCharArray()
@@ -1079,7 +1108,7 @@ $txtUserNotes = New-Memo $cUserNotes 12 30 360 96
 $txtUserNotes.Anchor="Top,Left,Right"
 $btnUserSaveNotes = New-Btn $cUserNotes "Save Notes" $F.Heading $C.Bg $C.TextPrimary 12 136 130 30 $false
 $btnUserSaveNotes.FlatAppearance.BorderColor=$C.Border; $btnUserSaveNotes.FlatAppearance.BorderSize=1
-$lblUserNotesHint = New-Lbl $cUserNotes "Writes to the AD info/Notes attribute." $F.Small $C.TextMuted 154 143
+$lblUserNotesHint = New-Lbl $cUserNotes "Updates the 'Notes last updated by' line." $F.Small $C.TextMuted 154 143
 $cUserNotes.Add_Resize({ Update-UserNotesLayout })
 $splitUser.Add_SplitterMoved({ Update-UserNotesLayout })
 
@@ -1218,11 +1247,12 @@ $btnRefresh.Add_Click({ if($script:CurUser){ $txtUserSearch.Text=$script:CurUser
 $btnUserSaveNotes.Add_Click({
     if(-not $script:CurUser){return}
     $u=$script:CurUser.SamAccountName
-    $notes=$txtUserNotes.Text
+    $notes=New-StampedAdNotes -Notes $txtUserNotes.Text
     $btnUserSaveNotes.Enabled=$false
     Set-Status "Updating AD notes for $u..." "info"
     $r=Update-UserNotes -Username $u -Notes $notes
     if($r.Success){
+        $txtUserNotes.Text = $notes
         try { $script:CurUser.info = $notes } catch { }
         Set-Status "AD notes updated for $u." "success"
         $btnUserSaveNotes.Enabled=$true
@@ -1361,7 +1391,7 @@ $txtComputerNotes = New-Memo $cCompNotes 12 30 360 96
 $txtComputerNotes.Anchor="Top,Left,Right"
 $btnComputerSaveNotes = New-Btn $cCompNotes "Save Notes" $F.Heading $C.Bg $C.TextPrimary 12 136 130 30 $false
 $btnComputerSaveNotes.FlatAppearance.BorderColor=$C.Border; $btnComputerSaveNotes.FlatAppearance.BorderSize=1
-$lblComputerNotesHint = New-Lbl $cCompNotes "Writes to the AD info/Notes attribute." $F.Small $C.TextMuted 154 143
+$lblComputerNotesHint = New-Lbl $cCompNotes "Updates the 'Notes last updated by' line." $F.Small $C.TextMuted 154 143
 $cCompNotes.Add_Resize({ Update-ComputerNotesLayout })
 $splitComputer.Add_SplitterMoved({ Update-ComputerNotesLayout })
 
@@ -1465,11 +1495,12 @@ $btnComputerRefresh.Add_Click({ if($script:CurComputer){ $txtComputerSearch.Text
 $btnComputerSaveNotes.Add_Click({
     if(-not $script:CurComputer){return}
     $name=$script:CurComputer.Name
-    $notes=$txtComputerNotes.Text
+    $notes=New-StampedAdNotes -Notes $txtComputerNotes.Text
     $btnComputerSaveNotes.Enabled=$false
     Set-Status "Updating AD notes for $name..." "info"
     $r=Update-ComputerNotes -ComputerName $name -Notes $notes
     if($r.Success){
+        $txtComputerNotes.Text = $notes
         try { $script:CurComputer.info = $notes } catch { }
         Set-Status "AD notes updated for $name." "success"
         $btnComputerSaveNotes.Enabled=$true

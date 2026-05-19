@@ -63,7 +63,7 @@ It shows OU path, DNS hostname, IP address from AD/DNS, operating system, last l
 
 ## AD notes
 
-The **User** and **Computer** tabs can view and update the object's AD **Notes** field (`info` attribute). Use it for helpdesk context such as known lockout causes, stale device notes, or ticket references. The existing **Refresh** buttons pull the latest values back from AD.
+The **User** and **Computer** tabs can view and update the object's AD **Notes** field (`info` attribute). Saved notes add or replace a top `Notes last updated by ... on YYYY-MM-DD` line, then write the note body to AD. Use notes for helpdesk context such as known lockout causes, stale device notes, or ticket references. The existing **Refresh** buttons pull the latest values back from AD.
 
 ## Configuration
 
@@ -101,16 +101,16 @@ SELF permissions require per-object ACL review in ADUC or a custom audit script;
 
 ## Publishing a new release (maintainers)
 
-1. Update `$SCRIPT_VERSION` in `ADTools.ps1` to match the tag.
-2. Commit and push to `main`.
-3. Create and push a version tag (triggers the release workflow):
+Pushing to `main` automatically creates the next patch release. The workflow reads the latest `vX.Y.Z` tag, increments the patch version, updates `$SCRIPT_VERSION`, commits that version bump, tags it, and publishes a GitHub Release.
+
+For a manual minor/major release, include `[skip tag]` in the commit message, push to `main`, then create and push the desired version tag:
 
 ```powershell
-git tag v2.1.0
-git push origin v2.1.0
+git tag v2.4.0
+git push origin v2.4.0
 ```
 
-The workflow builds `ADTools-v2.1.0.zip` and attaches it to the GitHub Release automatically.
+The tag workflow builds `ADTools-vX.Y.Z.zip` and attaches it to the GitHub Release automatically.
 
 ## License
 

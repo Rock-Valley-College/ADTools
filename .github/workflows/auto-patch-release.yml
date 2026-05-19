@@ -1,0 +1,88 @@
+name: Auto Patch Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  auto-patch-release:
+    if: github.actor != 'github-actions[bot]' && !contains(github.event.head_commit.message, '[skip tag]')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate next patch version
+        id: version
+        shell: pwsh
+        run: |
+          $tags = git tag --list 'v[0-9]*.[0-9]*.[0-9]*'
+          if (-not $tags) {
+            throw 'No existing vX.Y.Z tags found. Create the first release tag manually.'
+          }
+
+          $versions = foreach ($tag in $tags) {
+            if ($tag -match '^v(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)$') {
+              [pscustomobject]@{
+                Tag = $tag
+                Major = [int]$Matches.major
+                Minor = [int]$Matches.minor
+                Patch = [int]$Matches.patch
+              }
+            }
+          }
+
+          $latest = $versions | Sort-Object Major, Minor, Patch -Descending | Select-Object -First 1
+          $major = $latest.Major
+          $minor = $latest.Minor
+          $patch = $latest.Patch + 1
+          do {
+            $version = "$major.$minor.$patch"
+            $tag = "v$version"
+            $exists = git tag --list $tag
+            if ($exists) { $patch++ }
+          } while ($exists)
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "Latest tag: $($latest.Tag)"
+          Write-Host "Next tag:   $tag"
+
+      - name: Update script version
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $script = Get-Content -LiteralPath .\ADTools.ps1 -Raw
+          $script = $script -replace 'Version:\s+\d+\.\d+\.\d+', "Version:  $version"
+          $script = $script -replace '\$SCRIPT_VERSION\s*=\s*"\d+\.\d+\.\d+"', "`$SCRIPT_VERSION = `"$version`""
+          Set-Content -LiteralPath .\ADTools.ps1 -Value $script -NoNewline
+
+      - name: Commit version bump and tag
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.version.outputs.tag }}'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add ADTools.ps1
+          git commit -m "Release $tag [skip tag]"
+          git tag -a $tag -m "ADTools $tag"
+          git push origin HEAD:main
+          git push origin $tag
+
+      - name: Package ADTools
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.version.outputs.tag }}'
+          Compress-Archive -Path ADTools.ps1, config.json -DestinationPath "ADTools-$tag.zip" -Force
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: ADTools-*.zip
+          generate_release_notes: true
