@@ -945,9 +945,18 @@ $pnlStatus.Add_Resize({
 $lnkUpdates.Location=New-Object System.Drawing.Point(780,6)
 
 function Set-Status {
-    param([string]$Msg,[string]$Type="info")
-    $lblStatus.ForeColor=switch($Type){"success"{$C.Success}"error"{$C.Danger}"warning"{$C.Warning}default{$C.TextPrimary}}
-    $lblStatus.Text=$Msg
+    param([string]$Msg, [string]$Type = 'info')
+    $colors = @{
+        'success' = $C.Success
+        'error'   = $C.Danger
+        'warning' = $C.Warning
+        'info'    = $C.TextPrimary
+    }
+    $key = if ([string]::IsNullOrEmpty($Type)) { 'info' } else { $Type.ToLowerInvariant() }
+    $fc = $colors[$key]
+    if ($null -eq $fc) { $fc = $C.TextPrimary }
+    $lblStatus.ForeColor = $fc
+    $lblStatus.Text = $Msg
 }
 
 # -- BODY (toolbars + tab pages in one Fill panel so layout stacks correctly) -----
@@ -1542,12 +1551,24 @@ $btnClrLog = New-Btn $pnlLkAct "Clear"         $F.Small $C.Bg $C.TextPrimary  14
 $btnClrLog.FlatAppearance.BorderColor=$C.Border; $btnClrLog.FlatAppearance.BorderSize=1
 
 function Write-Log {
-    param([string]$Text,[string]$Type="normal")
-    $col=switch($Type){
-        "heading"{$C.LogAccent}"warn"{$C.LogWarn}"error"{$C.LogError}
-        "success"{$C.LogSuccess}"muted"{$C.LogMuted}"label"{$C.TextMuted}default{$C.LogNormal}}
-    $rtbLog.SelectionStart=$rtbLog.TextLength; $rtbLog.SelectionLength=0
-    $rtbLog.SelectionColor=$col; $rtbLog.AppendText($Text+"`n"); $rtbLog.ScrollToCaret()
+    param([string]$Text, [string]$Type = 'normal')
+    $colors = @{
+        'heading' = $C.LogAccent
+        'warn'    = $C.LogWarn
+        'error'   = $C.LogError
+        'success' = $C.LogSuccess
+        'muted'   = $C.LogMuted
+        'label'   = $C.TextMuted
+        'normal'  = $C.LogNormal
+    }
+    $key = if ([string]::IsNullOrEmpty($Type)) { 'normal' } else { $Type.ToLowerInvariant() }
+    $col = $colors[$key]
+    if ($null -eq $col) { $col = $C.LogNormal }
+    $rtbLog.SelectionStart = $rtbLog.TextLength
+    $rtbLog.SelectionLength = 0
+    $rtbLog.SelectionColor = $col
+    $rtbLog.AppendText($Text + "`n")
+    $rtbLog.ScrollToCaret()
 }
 
 $script:DiagResults = New-Object System.Collections.Generic.List[object]
