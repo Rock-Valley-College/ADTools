@@ -473,7 +473,7 @@ function Get-UserAccount {
     $props = @(
         'DisplayName', 'EmailAddress', 'Department', 'Title', 'DistinguishedName', 'Enabled',
         'LockedOut', 'CannotChangePassword', 'PasswordNeverExpires', 'PasswordLastSet',
-        'PasswordExpired', 'LastLogonDate', 'Created', 'MemberOf', 'info'
+        'PasswordExpired', 'pwdLastSet', 'LastLogonDate', 'Created', 'MemberOf', 'info'
     )
     $userCmd = "Get-ADUser -Identity '$Username' -Properties $($props -join ',')"
     try {
@@ -650,7 +650,18 @@ function Get-OUPathFromDN {
 
 function Test-MustChangePasswordAtLogon {
     param($User)
-    if ($null -eq $User.PasswordLastSet) { return $false }
+
+    $rawPwdLastSet = $null
+    $rawProp = $User.PSObject.Properties['pwdLastSet']
+    if ($rawProp) { $rawPwdLastSet = $rawProp.Value }
+
+    if ($null -ne $rawPwdLastSet) {
+        try { return ([Int64]$rawPwdLastSet -eq 0) } catch {
+            return ([string]$rawPwdLastSet -eq '0')
+        }
+    }
+
+    if ($null -eq $User.PasswordLastSet) { return $true }
     return ($User.PasswordLastSet.ToUniversalTime().Year -le 1601)
 }
 
