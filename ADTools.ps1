@@ -23,13 +23,13 @@
       (Domain Admin or delegated Event Log Reader on DCs)
 
 .NOTES
-    Version:  2.3.4
+    Version:  2.3.5
     GitHub:   https://github.com/Rock-Valley-College/ADTools
     Releases: https://github.com/Rock-Valley-College/ADTools/releases
 #>
 
 # -- VERSION -------------------------------------------------------------------
-$SCRIPT_VERSION = "2.3.4"
+$SCRIPT_VERSION = "2.3.5"
 $REPO_URL      = "https://github.com/Rock-Valley-College/ADTools"
 $RELEASES_URL  = "$REPO_URL/releases"
 
@@ -631,6 +631,21 @@ function Invoke-AccountUnlock {
     return $result
 }
 
+function Invoke-AccountEnable {
+    param([string]$Username)
+    $result = @{ Success=$false; Error="" }
+    $nameCheck = Test-SamAccountName -Username $Username
+    if (-not $nameCheck.Valid) { $result.Error=$nameCheck.Error; return $result }
+    $ad = Test-ADConnectivity
+    if (-not $ad.Ready) { $result.Error=$ad.Error; return $result }
+    try {
+        Invoke-LoggedAd { Enable-ADAccount -Identity $Username -ErrorAction Stop } -CommandLabel "Enable-ADAccount -Identity '$Username'"
+        $result.Success=$true
+    } catch [System.UnauthorizedAccessException] { $result.Error="Access denied - no permission to enable this account."
+    } catch { $result.Error="Enable failed: $($_.Exception.Message)" }
+    return $result
+}
+
 function Format-DateOrNever {
     param($Value)
     if ($null -eq $Value) { return "Never" }
@@ -1044,9 +1059,6 @@ $chkShow.Checked=$true; $chkShow.Location=New-Object System.Drawing.Point(14,80)
 $chkShow.FlatStyle="Flat"; Set-ControlDarkStyle $chkShow $C.Card
 $cPwd.Controls.Add($chkShow)
 
-$lblTempPwdHint = New-Lbl $cPwd "Quarry: phone-friendly passwords" $F.Small $C.TextMuted 158 82 $false
-$lblTempPwdHint.Size = New-Object System.Drawing.Size(190,16)
-
 $btnRstPwd = New-Btn   $cPwd "Reset Password" $F.Heading $C.Accent ([System.Drawing.Color]::White) 14 106 344 32 $false
 
 # Right - Groups
@@ -1072,12 +1084,14 @@ $cUserNotes.Add_Resize({ Update-UserNotesLayout })
 $splitUser.Add_SplitterMoved({ Update-UserNotesLayout })
 
 # Right - Actions
-$cAct = New-Card $splitUser.Panel2 "Actions" 84
-$btnUnlock  = New-Btn $cAct "Unlock Account"    $F.Heading $C.Bg $C.TextPrimary  14  30 180 34 $false
+$cAct = New-Card $splitUser.Panel2 "Actions" 120
+$btnUnlock  = New-Btn $cAct "Unlock Account"    $F.Heading $C.Bg $C.TextPrimary  14  30 150 34 $false
 $btnUnlock.FlatAppearance.BorderColor=$C.Warning; $btnUnlock.FlatAppearance.BorderSize=1
-$btnRefresh = New-Btn $cAct "Refresh"             $F.Heading $C.Bg $C.TextPrimary 206 30 110 34 $false
+$btnEnable  = New-Btn $cAct "Enable Account"     $F.Heading $C.Bg $C.TextPrimary 176 30 150 34 $false
+$btnEnable.FlatAppearance.BorderColor=$C.Success; $btnEnable.FlatAppearance.BorderSize=1
+$btnRefresh = New-Btn $cAct "Refresh"             $F.Heading $C.Bg $C.TextPrimary 338 30 100 34 $false
 $btnRefresh.FlatAppearance.BorderColor=$C.Border; $btnRefresh.FlatAppearance.BorderSize=1
-$btnDiag    = New-Btn $cAct "Diagnose Lockout"   $F.Heading $C.Bg $C.TextPrimary   330 30 180 34 $false
+$btnDiag    = New-Btn $cAct "Diagnose Lockout"   $F.Heading $C.Bg $C.TextPrimary   14 74 180 34 $false
 $btnDiag.FlatAppearance.BorderColor=$C.Danger; $btnDiag.FlatAppearance.BorderSize=1
 $btnDiag.Visible=$false
 
@@ -1093,7 +1107,7 @@ function Clear-UDisplay {
     $vNvrExp.Text="-"; $vCantChg.Text="-"; $vMustChg.Text="-"; $vSelfChg.Text="-"; $vOU.Text="-"
     $lstGroups.Items.Clear(); $txtPwd.Text=""; $txtUserNotes.Text=""; $txtUserNotes.Enabled=$false
     $btnRstPwd.Enabled=$false; $btnGenPwd.Enabled=$false; $btnCpyPwd.Enabled=$false
-    $btnUnlock.Enabled=$false; $btnRefresh.Enabled=$false; $btnUserSaveNotes.Enabled=$false; $btnDiag.Visible=$false
+    $btnUnlock.Enabled=$false; $btnEnable.Enabled=$false; $btnRefresh.Enabled=$false; $btnUserSaveNotes.Enabled=$false; $btnDiag.Visible=$false
     $script:CurUser=$null; $script:CurGroups=@(); $script:CurPasswordStatus=$null
 }
 
@@ -1104,8 +1118,8 @@ function Show-UData {
     $lblMail.Text= if($User.EmailAddress){$User.EmailAddress}else{"No email on file"}
     $dp=@(); if($User.Title){$dp+=$User.Title}; if($User.Department){$dp+=$User.Department}
     $lblDept.Text= if($dp){$dp -join "  |  "}else{"No dept/title on file"}
-    if($User.Enabled){ $lblStat.Text="* ACTIVE";    $lblStat.ForeColor=$C.Success }
-    else             { $lblStat.Text="* DISABLED";  $lblStat.ForeColor=$C.Danger  }
+    if($User.Enabled){ $lblStat.Text="* ACTIVE";    $lblStat.ForeColor=$C.Success; $btnEnable.Enabled=$false }
+    else             { $lblStat.Text="* DISABLED";  $lblStat.ForeColor=$C.Danger;  $btnEnable.Enabled=$true  }
     if($User.LockedOut){
         $lblLock.Text="LOCKED OUT"; $btnUnlock.Enabled=$true; $btnDiag.Visible=$true
     } else { $lblLock.Text=""; $btnUnlock.Enabled=$false; $btnDiag.Visible=$false }
@@ -1258,6 +1272,21 @@ $btnUnlock.Add_Click({
         Set-Status "Account unlocked for $($script:CurUser.DisplayName)." "success"
         $lblLock.Text=""; $btnDiag.Visible=$false
     } else { Set-Status $r.Error "error"; $btnUnlock.Enabled=$true }
+})
+
+$btnEnable.Add_Click({
+    if(-not $script:CurUser){return}
+    $u=$script:CurUser.SamAccountName
+    $c=[System.Windows.Forms.MessageBox]::Show("Enable account for $($script:CurUser.DisplayName) ($u)?",
+        "Confirm Enable",[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Question)
+    if($c -ne "Yes"){return}
+    $btnEnable.Enabled=$false; Set-Status "Enabling $u..." "info"
+    $r=Invoke-AccountEnable -Username $u
+    if($r.Success){
+        $script:CurUser.Enabled=$true
+        $lblStat.Text="* ACTIVE"; $lblStat.ForeColor=$C.Success
+        Set-Status "Account enabled for $($script:CurUser.DisplayName)." "success"
+    } else { Set-Status $r.Error "error"; $btnEnable.Enabled=$true }
 })
 
 # Diagnose button - prefill lockout tab and switch to it

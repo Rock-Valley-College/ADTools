@@ -1,6 +1,6 @@
 # ADTools
 
-PowerShell GUI for on-premises Active Directory helpdesk tasks: user lookup, computer lookup, AD notes, password reset, account unlock, and lockout diagnostics.
+PowerShell GUI for on-premises Active Directory helpdesk tasks: user lookup, computer lookup, AD notes, password reset, account unlock/enable, and lockout diagnostics.
 
 **Repository:** [github.com/Rock-Valley-College/ADTools](https://github.com/Rock-Valley-College/ADTools)
 
@@ -74,7 +74,7 @@ Edit `config.json` next to the script:
 | `MinPasswordLength` | 16 | Minimum length for reset passwords |
 | `TempPasswordLength` | 16 | Length of generated temporary passwords (built-in **New** button) |
 
-The built-in generator meets AD complexity rules. The Quarry has a temp password generator for easy over the phone passwords; copy one into the password field, then **Reset Password**.
+The built-in generator meets AD complexity rules. Copy the generated value into the password field, then **Reset Password**.
 
 Restart the app after changing config.
 
