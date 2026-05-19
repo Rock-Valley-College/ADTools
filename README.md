@@ -1,6 +1,6 @@
 # ADTools
 
-PowerShell GUI for on-premises Active Directory helpdesk tasks: user lookup, password reset, account unlock, and lockout diagnostics.
+PowerShell GUI for on-premises Active Directory helpdesk tasks: user lookup, computer lookup, password reset, account unlock, and lockout diagnostics.
 
 **Repository:** [github.com/Rock-Valley-College/ADTools](https://github.com/Rock-Valley-College/ADTools)
 
@@ -41,11 +41,25 @@ If the window flashes and closes, run with STA explicitly (required for WinForms
 powershell -STA -File .\ADTools.ps1
 ```
 
+To run the latest script directly from GitHub without downloading the zip:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -STA -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm https://raw.githubusercontent.com/Rock-Valley-College/ADTools/main/ADTools.ps1 | iex"
+```
+
+Remote runs use the built-in defaults from `ADTools.ps1`. To customize settings with `config.json`, download the release zip and run the local copy.
+
 Startup errors are also written to `ADTools-startup.log` beside the script (or in `%TEMP%`).
 
 The app opens even when the domain is unreachable (for example, off VPN). AD actions show a status message until you are connected. Install the RSAT Active Directory module on the PC; domain-joined is recommended when you run lookups and resets.
 
 **Note:** The script is saved as ASCII-only (UTF-8 with BOM) so PowerShell 5.1 on any Windows locale parses it correctly. The UI uses a standard light grey theme so text stays readable regardless of Windows dark/light mode.
+
+## Computer lookup
+
+The **Computer** tab helps helpdesk staff quickly verify an AD computer object. Search by computer name with or without the trailing `$`.
+
+It shows OU path, DNS hostname, IP address from AD/DNS, operating system, last logon, password last set, managed-by, description/location, and computer group memberships. Use **Copy Summary** to paste the key details into a ticket.
 
 ## Configuration
 

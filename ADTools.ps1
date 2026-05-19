@@ -6,7 +6,9 @@
 
     Tab 1 - User:               Look up any AD account, view full details,
                                  group memberships, reset password, unlock.
-    Tab 2 - Lockout Diagnostics: Find what's causing account lockouts by
+    Tab 2 - Computer:           Look up AD computer objects, OU placement,
+                                 OS, IP/DNS details, and memberships.
+    Tab 3 - Lockout Diagnostics: Find what's causing account lockouts by
                                  querying all DCs and pulling Security event
                                  log entries (4740 lockout, 4625 bad logon).
 
@@ -21,13 +23,13 @@
       (Domain Admin or delegated Event Log Reader on DCs)
 
 .NOTES
-    Version:  2.2.12
+    Version:  2.3.1
     GitHub:   https://github.com/Rock-Valley-College/ADTools
     Releases: https://github.com/Rock-Valley-College/ADTools/releases
 #>
 
 # -- VERSION -------------------------------------------------------------------
-$SCRIPT_VERSION = "2.2.12"
+$SCRIPT_VERSION = "2.3.1"
 $REPO_URL      = "https://github.com/Rock-Valley-College/ADTools"
 $RELEASES_URL  = "$REPO_URL/releases"
 
@@ -83,8 +85,8 @@ $CONFIG = @{
     TempPasswordGeneratorUrl  = 'https://quarry.rockvalleycollege.cloud/temp-password'
 }
 
-$configPath = Join-Path $PSScriptRoot 'config.json'
-if (Test-Path -LiteralPath $configPath) {
+$configPath = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'config.json' } else { $null }
+if ($configPath -and (Test-Path -LiteralPath $configPath)) {
     try {
         $localConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
         foreach ($key in $localConfig.PSObject.Properties.Name) {
@@ -442,6 +444,14 @@ function Test-SamAccountName {
     return @{ Valid=$true; Error="" }
 }
 
+function Test-ComputerAccountName {
+    param([string]$ComputerName)
+    if ([string]::IsNullOrWhiteSpace($ComputerName)) { return @{ Valid=$false; Error="Please enter a computer name." } }
+    $clean = $ComputerName.Trim().TrimEnd('$')
+    if ($clean -notmatch '^[a-zA-Z0-9._-]+$') { return @{ Valid=$false; Error="Invalid computer name characters." } }
+    return @{ Valid=$true; Name=$clean; Error="" }
+}
+
 function New-TempPassword {
     $upper   = 'ABCDEFGHJKLMNPQRSTUVWXYZ'.ToCharArray()
     $lower   = 'abcdefghjkmnpqrstuvwxyz'.ToCharArray()
@@ -487,6 +497,62 @@ function Get-UserAccount {
     return $result
 }
 
+function Resolve-ComputerIPv4Address {
+    param($Computer)
+    if ($Computer.IPv4Address) { return [string]$Computer.IPv4Address }
+    $target = if ($Computer.DNSHostName) { $Computer.DNSHostName } else { $Computer.Name }
+    if ([string]::IsNullOrWhiteSpace($target)) { return '' }
+    try {
+        $addr = [System.Net.Dns]::GetHostAddresses($target) |
+            Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } |
+            Select-Object -First 1
+        if ($addr) { return [string]$addr.IPAddressToString }
+    } catch { }
+    return ''
+}
+
+function Get-NameFromDN {
+    param([string]$DN)
+    if ([string]::IsNullOrWhiteSpace($DN)) { return '' }
+    $cn = ($DN -split ',' | Where-Object { $_ -match '^CN=' } | Select-Object -First 1)
+    if ($cn) { return ($cn -replace '^CN=','') -replace '\\,', ',' -replace '\\"', '"' }
+    return $DN
+}
+
+function Get-ComputerAccount {
+    param([string]$ComputerName)
+    $result = @{ Success=$false; Computer=$null; Groups=@(); IPAddress=''; Error="" }
+    $nameCheck = Test-ComputerAccountName -ComputerName $ComputerName
+    if (-not $nameCheck.Valid) { $result.Error=$nameCheck.Error; return $result }
+    $ad = Test-ADConnectivity
+    if (-not $ad.Ready) { $result.Error=$ad.Error; return $result }
+    $name = $nameCheck.Name
+    $props = @(
+        'DNSHostName', 'IPv4Address', 'Description', 'DistinguishedName', 'Enabled',
+        'OperatingSystem', 'OperatingSystemVersion', 'LastLogonDate', 'Created',
+        'Modified', 'PasswordLastSet', 'MemberOf', 'ManagedBy', 'Location'
+    )
+    $computerCmd = "Get-ADComputer -Identity '$name' -Properties $($props -join ',')"
+    try {
+        $computer = Invoke-LoggedAd {
+            Get-ADComputer -Identity $name -Properties $props -ErrorAction Stop
+        } -CommandLabel $computerCmd
+    } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+        $result.Error = "No computer found for '$name'."
+        return $result
+    } catch {
+        $result.Error = "Computer lookup failed: $($_.Exception.Message)"
+        return $result
+    }
+    $memberCount = @($computer.MemberOf).Count
+    Write-TerminalLog "Resolved $memberCount computer group name(s) from MemberOf (no per-group AD queries)" 'info'
+    $result.Success = $true
+    $result.Computer = $computer
+    $result.Groups = Get-GroupNamesFromMemberOf -MemberOf $computer.MemberOf
+    $result.IPAddress = Resolve-ComputerIPv4Address -Computer $computer
+    return $result
+}
+
 function Invoke-PasswordReset {
     param([string]$Username,[string]$NewPassword)
     $result = @{ Success=$false; Error="" }
@@ -529,6 +595,13 @@ function Get-OUFromDN {
     param([string]$DN)
     $ou = ($DN -split ',' | Where-Object { $_ -match '^OU=' } | Select-Object -First 1)
     if ($ou) { return $ou -replace '^OU=','' }
+    return $DN
+}
+
+function Get-OUPathFromDN {
+    param([string]$DN)
+    $ous = @($DN -split ',' | Where-Object { $_ -match '^OU=' } | ForEach-Object { $_ -replace '^OU=','' })
+    if ($ous.Count -gt 0) { return ($ous -join ' / ') }
     return $DN
 }
 
@@ -680,13 +753,19 @@ function Set-TabNavStyle {
 }
 
 function Switch-AppTab {
-    param([ValidateSet('User', 'Lockout')][string]$Name)
+    param([ValidateSet('User', 'Computer', 'Lockout')][string]$Name)
     $userOn = ($Name -eq 'User')
+    $computerOn = ($Name -eq 'Computer')
+    $lockoutOn = ($Name -eq 'Lockout')
     $pnlUserTab.Visible = $userOn
-    $pnlLockoutTab.Visible = -not $userOn
+    $pnlComputerTab.Visible = $computerOn
+    $pnlLockoutTab.Visible = $lockoutOn
     Set-TabNavStyle $btnTabUser $userOn
-    Set-TabNavStyle $btnTabLockout (-not $userOn)
-    if ($userOn) { $txtUserSearch.Focus() } else { $txtLockoutUser.Focus() }
+    Set-TabNavStyle $btnTabComputer $computerOn
+    Set-TabNavStyle $btnTabLockout $lockoutOn
+    if ($userOn) { $txtUserSearch.Focus() }
+    elseif ($computerOn) { $txtComputerSearch.Focus() }
+    else { $txtLockoutUser.Focus() }
 }
 
 # -- FORM ----------------------------------------------------------------------
@@ -722,19 +801,27 @@ $pnlTabBar = New-Object System.Windows.Forms.Panel
 $pnlTabBar.Dock="Top"; $pnlTabBar.Height=48; $pnlTabBar.BackColor=$C.Bg
 
 $btnTabUser = New-Object System.Windows.Forms.Button
-$btnTabUser.Text="User"; $btnTabUser.Width=200; $btnTabUser.Height=40
+$btnTabUser.Text="User"; $btnTabUser.Width=170; $btnTabUser.Height=40
 $btnTabUser.Dock="Left"; $btnTabUser.Cursor="Hand"
+
+$btnTabComputer = New-Object System.Windows.Forms.Button
+$btnTabComputer.Text="Computer"; $btnTabComputer.Width=190; $btnTabComputer.Height=40
+$btnTabComputer.Dock="Left"; $btnTabComputer.Cursor="Hand"
 
 $btnTabLockout = New-Object System.Windows.Forms.Button
 $btnTabLockout.Text="Lockout Diagnostics"; $btnTabLockout.Height=40
 $btnTabLockout.Dock="Fill"; $btnTabLockout.Cursor="Hand"
 
 $pnlTabBar.Controls.Add($btnTabLockout)
+$pnlTabBar.Controls.Add($btnTabComputer)
 $pnlTabBar.Controls.Add($btnTabUser)
 
 # Toolbar rows on the form (below tabs) so Fill panels cannot cover them
 $pnlUserSearch = New-Object System.Windows.Forms.Panel
 $pnlUserSearch.Dock="Top"; $pnlUserSearch.Height=56; $pnlUserSearch.BackColor=$C.Bg
+
+$pnlComputerSearch = New-Object System.Windows.Forms.Panel
+$pnlComputerSearch.Dock="Top"; $pnlComputerSearch.Height=56; $pnlComputerSearch.BackColor=$C.Bg
 
 $pnlLkCtrl = New-Object System.Windows.Forms.Panel
 $pnlLkCtrl.Dock="Top"; $pnlLkCtrl.Height=56; $pnlLkCtrl.BackColor=$C.Bg
@@ -783,17 +870,23 @@ $pnlShell.Dock="Fill"; $pnlShell.BackColor=$C.Bg
 $pnlUserTab = New-Object System.Windows.Forms.Panel
 $pnlUserTab.Dock="Fill"; $pnlUserTab.BackColor=$C.Bg; $pnlUserTab.Visible=$true
 
+$pnlComputerTab = New-Object System.Windows.Forms.Panel
+$pnlComputerTab.Dock="Fill"; $pnlComputerTab.BackColor=$C.Bg; $pnlComputerTab.Visible=$false
+
 $pnlLockoutTab = New-Object System.Windows.Forms.Panel
 $pnlLockoutTab.Dock="Fill"; $pnlLockoutTab.BackColor=$C.Bg; $pnlLockoutTab.Visible=$false
 
 $pnlShell.Controls.Add($pnlLockoutTab)
+$pnlShell.Controls.Add($pnlComputerTab)
 $pnlShell.Controls.Add($pnlUserTab)
 
 $pnlBody.Controls.Add($pnlShell)
 
 $btnTabUser.Add_Click({ Switch-AppTab -Name User })
+$btnTabComputer.Add_Click({ Switch-AppTab -Name Computer })
 $btnTabLockout.Add_Click({ Switch-AppTab -Name Lockout })
 Set-TabNavStyle $btnTabUser $true
+Set-TabNavStyle $btnTabComputer $false
 Set-TabNavStyle $btnTabLockout $false
 
 $form.Controls.Add($pnlBody)
@@ -1100,7 +1193,167 @@ $btnDiag.Add_Click({
 })
 
 # ==============================================================================
-# TAB 2 - LOCKOUT DIAGNOSTICS
+# TAB 2 - COMPUTER
+# ==============================================================================
+
+$splitComputer = New-Object System.Windows.Forms.SplitContainer
+$splitComputer.Dock="Fill"; $splitComputer.BackColor=$C.Bg; $splitComputer.BorderStyle="None"
+$splitComputer.Panel1.AutoScroll=$true; $splitComputer.Panel2.AutoScroll=$true
+$splitComputer.Panel1.Padding=New-Object System.Windows.Forms.Padding(8,8,4,8)
+$splitComputer.Panel2.Padding=New-Object System.Windows.Forms.Padding(4,8,8,8)
+
+function Update-ComputerGroupsListHeight {
+    if (-not $cCompGrp -or -not $lstComputerGroups) { return }
+    $lstComputerGroups.Width=[Math]::Max(100,$cCompGrp.ClientSize.Width-24)
+    $lstComputerGroups.Height=[Math]::Max(120,$cCompGrp.ClientSize.Height-36)
+}
+
+$pnlComputerTab.Controls.Add($splitComputer)
+
+New-Lbl $pnlComputerSearch "Computer" $F.Heading $C.TextPrimary 12 18 | Out-Null
+$txtComputerSearch = New-Txt $pnlComputerSearch 98 14 320 $F.Mono
+$btnComputerSearch = New-Btn $pnlComputerSearch "Look Up" $F.Heading $C.Accent ([System.Drawing.Color]::White) 430 14 86 28
+
+$cCompId = New-Card $splitComputer.Panel1 "Identity" 155
+$lblCompName = New-Lbl $cCompId "-" (New-Object System.Drawing.Font("Segoe UI",15,[System.Drawing.FontStyle]::Bold)) $C.TextPrimary 14 28
+$lblCompName.Size=New-Object System.Drawing.Size(360,30)
+$lblCompDns  = New-Lbl $cCompId "-" $F.MonoSm $C.Accent 14 62
+$lblCompDesc = New-Lbl $cCompId "-" $F.Small $C.TextMuted 14 84
+$lblCompLoc  = New-Lbl $cCompId "-" $F.Small $C.TextMuted 14 104
+$lblCompStat = New-Lbl $cCompId "" $F.Heading $C.TextMuted 14 128
+
+$cCompDet = New-Card $splitComputer.Panel1 "Computer Details" 302
+$vCompOU      = New-DR $cCompDet "OU Path"            28
+$vCompIP      = New-DR $cCompDet "IP Address"         50
+$vCompOS      = New-DR $cCompDet "Operating System"   72
+$vCompOSVer   = New-DR $cCompDet "OS Version"         94
+$vCompLogon   = New-DR $cCompDet "Last Logon"         116
+$vCompPwdSet  = New-DR $cCompDet "Pwd Last Set"       138
+$vCompCreated = New-DR $cCompDet "Created"            160
+$vCompChanged = New-DR $cCompDet "Modified"           182
+$vCompManaged = New-DR $cCompDet "Managed By"         204
+$vCompDN      = New-DR $cCompDet "DN"                 226
+foreach ($compValue in @($vCompOU,$vCompIP,$vCompOS,$vCompOSVer,$vCompLogon,$vCompPwdSet,$vCompCreated,$vCompChanged,$vCompManaged)) {
+    $compValue.Size = New-Object System.Drawing.Size(360,16)
+}
+$vCompDN.Size = New-Object System.Drawing.Size(360,48)
+
+$cCompHelp = New-Card $splitComputer.Panel1 "Helpdesk Notes" 118
+$lblCompHint1 = New-Lbl $cCompHelp "Use OU Path to confirm the device is in the expected policy/location container." $F.Small $C.TextMuted 14 30 $false
+$lblCompHint1.Size=New-Object System.Drawing.Size(360,32)
+$lblCompHint2 = New-Lbl $cCompHelp "IP Address comes from AD/DNS and may be blank if the hostname does not resolve." $F.Small $C.TextMuted 14 64 $false
+$lblCompHint2.Size=New-Object System.Drawing.Size(360,32)
+
+$cCompGrp = New-Card $splitComputer.Panel2 "Computer Groups" 395
+$lstComputerGroups = New-Object System.Windows.Forms.ListBox
+$lstComputerGroups.Location=New-Object System.Drawing.Point(12,27)
+$lstComputerGroups.Size=New-Object System.Drawing.Size(360,358)
+$lstComputerGroups.BackColor=$C.InputBg; $lstComputerGroups.ForeColor=$C.TextPrimary
+$lstComputerGroups.BorderStyle="None"; $lstComputerGroups.Font=$F.MonoSm
+$lstComputerGroups.Anchor="Top,Left,Right,Bottom"
+$cCompGrp.Controls.Add($lstComputerGroups)
+$cCompGrp.Add_Resize({ Update-ComputerGroupsListHeight })
+$splitComputer.Add_SplitterMoved({ Update-ComputerGroupsListHeight })
+
+$cCompAct = New-Card $splitComputer.Panel2 "Actions" 84
+$btnComputerRefresh = New-Btn $cCompAct "Refresh"      $F.Heading $C.Bg $C.TextPrimary 14 30 110 34 $false
+$btnComputerRefresh.FlatAppearance.BorderColor=$C.Border; $btnComputerRefresh.FlatAppearance.BorderSize=1
+$btnComputerCopy    = New-Btn $cCompAct "Copy Summary" $F.Heading $C.Bg $C.TextPrimary 138 30 150 34 $false
+$btnComputerCopy.FlatAppearance.BorderColor=$C.Border; $btnComputerCopy.FlatAppearance.BorderSize=1
+
+$pnlComputerTab.Controls.Add($pnlComputerSearch)
+
+# -- COMPUTER TAB LOGIC --------------------------------------------------------
+$script:CurComputer=$null; $script:CurComputerGroups=@(); $script:CurComputerIP=''
+
+function Clear-CDisplay {
+    $lblCompName.Text="-"; $lblCompDns.Text="-"; $lblCompDesc.Text="-"; $lblCompLoc.Text="-"; $lblCompStat.Text=""
+    $vCompOU.Text="-"; $vCompIP.Text="-"; $vCompOS.Text="-"; $vCompOSVer.Text="-"; $vCompLogon.Text="-"
+    $vCompPwdSet.Text="-"; $vCompCreated.Text="-"; $vCompChanged.Text="-"; $vCompManaged.Text="-"; $vCompDN.Text="-"
+    $lstComputerGroups.Items.Clear()
+    $btnComputerRefresh.Enabled=$false; $btnComputerCopy.Enabled=$false
+    $script:CurComputer=$null; $script:CurComputerGroups=@(); $script:CurComputerIP=''
+}
+
+function Show-CData {
+    param($Computer, $Groups, [string]$IPAddress = '')
+    $lblCompName.Text = $Computer.Name
+    $lblCompDns.Text  = if($Computer.DNSHostName){$Computer.DNSHostName}else{"No DNS hostname on object"}
+    $lblCompDesc.Text = if($Computer.Description){$Computer.Description}else{"No description on file"}
+    $lblCompLoc.Text  = if($Computer.Location){"Location: $($Computer.Location)"}else{"No location on file"}
+    if($Computer.Enabled){ $lblCompStat.Text="* ENABLED"; $lblCompStat.ForeColor=$C.Success }
+    else                { $lblCompStat.Text="* DISABLED"; $lblCompStat.ForeColor=$C.Danger  }
+
+    $vCompOU.Text      = Get-OUPathFromDN $Computer.DistinguishedName
+    $vCompIP.Text      = if($IPAddress){$IPAddress}else{"Not found in DNS/AD"}
+    $vCompIP.ForeColor = if($IPAddress){$C.TextPrimary}else{$C.Warning}
+    $vCompOS.Text      = if($Computer.OperatingSystem){$Computer.OperatingSystem}else{"-"}
+    $vCompOSVer.Text   = if($Computer.OperatingSystemVersion){$Computer.OperatingSystemVersion}else{"-"}
+    $vCompLogon.Text   = Format-DateOrNever $Computer.LastLogonDate
+    $vCompPwdSet.Text  = Format-DateOrNever $Computer.PasswordLastSet
+    $vCompCreated.Text = Format-DateOrNever $Computer.Created
+    $vCompChanged.Text = Format-DateOrNever $Computer.Modified
+    $vCompManaged.Text = if($Computer.ManagedBy){Get-NameFromDN $Computer.ManagedBy}else{"-"}
+    $vCompDN.Text      = $Computer.DistinguishedName
+
+    $lstComputerGroups.Items.Clear()
+    if($Groups.Count -gt 0){ foreach($g in $Groups){ $lstComputerGroups.Items.Add($g)|Out-Null } }
+    else { $lstComputerGroups.Items.Add("(no computer group memberships)")|Out-Null }
+    $btnComputerRefresh.Enabled = $true
+    $btnComputerCopy.Enabled = $true
+    Set-Status "Loaded computer: $($Computer.Name)  |  $($Groups.Count) group(s)" 'success'
+}
+
+function Get-ComputerSummaryText {
+    if(-not $script:CurComputer){ return '' }
+    $c = $script:CurComputer
+    return @(
+        "Computer: $($c.Name)"
+        "DNS: $($c.DNSHostName)"
+        "IP: $script:CurComputerIP"
+        "Enabled: $($c.Enabled)"
+        "OU: $(Get-OUPathFromDN $c.DistinguishedName)"
+        "OS: $($c.OperatingSystem)"
+        "Last Logon: $(Format-DateOrNever $c.LastLogonDate)"
+        "Password Last Set: $(Format-DateOrNever $c.PasswordLastSet)"
+        "Managed By: $(if($c.ManagedBy){Get-NameFromDN $c.ManagedBy}else{'-'})"
+    ) -join "`r`n"
+}
+
+function Invoke-CSearch {
+    $name=$txtComputerSearch.Text.Trim(); if([string]::IsNullOrWhiteSpace($name)){return}
+    Clear-CDisplay; Set-Status "Looking up computer '$name'..." "info"
+    $btnComputerSearch.Enabled=$false
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-TerminalLog "----- Computer lookup: $name -----" 'info'
+    try {
+        $r = Get-ComputerAccount -ComputerName $name
+    } finally {
+        $btnComputerSearch.Enabled = $true
+    }
+    $sw.Stop()
+    if (-not $r.Success) {
+        Set-Status $r.Error "error"
+        Write-TerminalLog "Computer lookup failed for '$name'" 'err'
+        return
+    }
+    $script:CurComputer = $r.Computer
+    $script:CurComputerGroups = $r.Groups
+    $script:CurComputerIP = $r.IPAddress
+    Show-CData -Computer $r.Computer -Groups $r.Groups -IPAddress $r.IPAddress
+    Write-TerminalLog ("Computer lookup complete: $($r.Groups.Count) group(s), total {0:N0} ms" -f $sw.ElapsedMilliseconds) 'ok'
+}
+
+$btnComputerSearch.Add_Click({ Invoke-CSearch })
+$txtComputerSearch.Add_KeyDown({ if($_.KeyCode -eq "Return"){ Invoke-CSearch } })
+$btnComputerRefresh.Add_Click({ if($script:CurComputer){ $txtComputerSearch.Text=$script:CurComputer.Name; Invoke-CSearch } })
+$btnComputerCopy.Add_Click({
+    $summary = Get-ComputerSummaryText
+    if($summary){ [System.Windows.Forms.Clipboard]::SetText($summary); Set-Status "Computer summary copied to clipboard." "info" }
+})
+
+# ==============================================================================
+# TAB 3 - LOCKOUT DIAGNOSTICS
 # ==============================================================================
 
 $rtbLog = New-Object System.Windows.Forms.RichTextBox
@@ -1204,7 +1457,11 @@ $form.Add_Shown({
         if ($splitUser.Width -gt 100) {
             $splitUser.SplitterDistance=[int]($splitUser.Width*0.46)
         }
+        if ($splitComputer.Width -gt 100) {
+            $splitComputer.SplitterDistance=[int]($splitComputer.Width*0.46)
+        }
         Update-GroupsListHeight
+        Update-ComputerGroupsListHeight
         $txtUserSearch.Focus()
         $ad = Ensure-ADModule
         if (-not $ad.Ready) {
