@@ -23,13 +23,13 @@
       (Domain Admin or delegated Event Log Reader on DCs)
 
 .NOTES
-    Version:  2.3.3
+    Version:  2.3.4
     GitHub:   https://github.com/Rock-Valley-College/ADTools
     Releases: https://github.com/Rock-Valley-College/ADTools/releases
 #>
 
 # -- VERSION -------------------------------------------------------------------
-$SCRIPT_VERSION = "2.3.3"
+$SCRIPT_VERSION = "2.3.4"
 $REPO_URL      = "https://github.com/Rock-Valley-College/ADTools"
 $RELEASES_URL  = "$REPO_URL/releases"
 
@@ -1044,8 +1044,8 @@ $chkShow.Checked=$true; $chkShow.Location=New-Object System.Drawing.Point(14,80)
 $chkShow.FlatStyle="Flat"; Set-ControlDarkStyle $chkShow $C.Card
 $cPwd.Controls.Add($chkShow)
 
-$lblTempPwdHint = New-Lbl $cPwd "The Quarry has a temp password generator for easy over the phone passwords." $F.Small $C.TextMuted 158 82 $false
-$lblTempPwdHint.Size = New-Object System.Drawing.Size(190,36)
+$lblTempPwdHint = New-Lbl $cPwd "Quarry: phone-friendly passwords" $F.Small $C.TextMuted 158 82 $false
+$lblTempPwdHint.Size = New-Object System.Drawing.Size(190,16)
 
 $btnRstPwd = New-Btn   $cPwd "Reset Password" $F.Heading $C.Accent ([System.Drawing.Color]::White) 14 106 344 32 $false
 
@@ -1316,15 +1316,6 @@ foreach ($compValue in @($vCompOU,$vCompIP,$vCompOS,$vCompOSVer,$vCompLogon,$vCo
 }
 $vCompDN.Size = New-Object System.Drawing.Size(360,48)
 
-$cCompNotes = New-Card $splitComputer.Panel1 "AD Notes" 178
-$txtComputerNotes = New-Memo $cCompNotes 12 30 360 96
-$txtComputerNotes.Anchor="Top,Left,Right"
-$btnComputerSaveNotes = New-Btn $cCompNotes "Save Notes" $F.Heading $C.Bg $C.TextPrimary 12 136 130 30 $false
-$btnComputerSaveNotes.FlatAppearance.BorderColor=$C.Border; $btnComputerSaveNotes.FlatAppearance.BorderSize=1
-$lblComputerNotesHint = New-Lbl $cCompNotes "Writes to the AD info/Notes attribute." $F.Small $C.TextMuted 154 143
-$cCompNotes.Add_Resize({ Update-ComputerNotesLayout })
-$splitComputer.Add_SplitterMoved({ Update-ComputerNotesLayout })
-
 $cCompGrp = New-Card $splitComputer.Panel2 "Computer Groups" 395
 $lstComputerGroups = New-Object System.Windows.Forms.ListBox
 $lstComputerGroups.Location=New-Object System.Drawing.Point(12,27)
@@ -1335,6 +1326,15 @@ $lstComputerGroups.Anchor="Top,Left,Right,Bottom"
 $cCompGrp.Controls.Add($lstComputerGroups)
 $cCompGrp.Add_Resize({ Update-ComputerGroupsListHeight })
 $splitComputer.Add_SplitterMoved({ Update-ComputerGroupsListHeight })
+
+$cCompNotes = New-Card $splitComputer.Panel2 "AD Notes" 178
+$txtComputerNotes = New-Memo $cCompNotes 12 30 360 96
+$txtComputerNotes.Anchor="Top,Left,Right"
+$btnComputerSaveNotes = New-Btn $cCompNotes "Save Notes" $F.Heading $C.Bg $C.TextPrimary 12 136 130 30 $false
+$btnComputerSaveNotes.FlatAppearance.BorderColor=$C.Border; $btnComputerSaveNotes.FlatAppearance.BorderSize=1
+$lblComputerNotesHint = New-Lbl $cCompNotes "Writes to the AD info/Notes attribute." $F.Small $C.TextMuted 154 143
+$cCompNotes.Add_Resize({ Update-ComputerNotesLayout })
+$splitComputer.Add_SplitterMoved({ Update-ComputerNotesLayout })
 
 $cCompAct = New-Card $splitComputer.Panel2 "Actions" 84
 $btnComputerRefresh = New-Btn $cCompAct "Refresh"      $F.Heading $C.Bg $C.TextPrimary 14 30 110 34 $false
