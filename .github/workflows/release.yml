@@ -16,7 +16,7 @@ jobs:
 
       - name: Package ADTools
         run: |
-          zip -j "ADTools-${GITHUB_REF_NAME}.zip" ADTools.ps1 config.json
+          zip -j "ADTools-${GITHUB_REF_NAME}.zip" ADTools.ps1
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

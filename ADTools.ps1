@@ -5,7 +5,7 @@
     A tabbed helpdesk tool for Active Directory management.
 
     Tab 1 - User:               Look up any AD account, view full details,
-                                 group memberships, reset password, unlock.
+                                 group memberships, unlock.
     Tab 2 - Computer:           Look up AD computer objects, OU placement,
                                  OS, IP/DNS details, and memberships.
     Tab 3 - Lockout Diagnostics: Find what's causing account lockouts by
@@ -23,13 +23,13 @@
       (Domain Admin or delegated Event Log Reader on DCs)
 
 .NOTES
-    Version:  2.3.6
+    Version:  2.3.7
     GitHub:   https://github.com/Rock-Valley-College/ADTools
     Releases: https://github.com/Rock-Valley-College/ADTools/releases
 #>
 
 # -- VERSION -------------------------------------------------------------------
-$SCRIPT_VERSION = "2.3.6"
+$SCRIPT_VERSION = "2.3.7"
 $REPO_URL      = "https://github.com/Rock-Valley-College/ADTools"
 $RELEASES_URL  = "$REPO_URL/releases"
 
@@ -76,23 +76,6 @@ if ($PSCommandPath) {
         $proc = Start-Process -FilePath $psExe -ArgumentList $argList -Wait -PassThru
         exit $(if ($null -ne $proc.ExitCode) { $proc.ExitCode } else { 0 })
     }
-}
-
-# -- CONFIG (local config.json beside this script) -----------------------------
-$CONFIG = @{
-    MinPasswordLength         = 16
-    TempPasswordLength        = 16
-}
-
-$configPath = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'config.json' } else { $null }
-if ($configPath -and (Test-Path -LiteralPath $configPath)) {
-    try {
-        $localConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-        foreach ($key in $localConfig.PSObject.Properties.Name) {
-            if ($key -eq '_comment') { continue }
-            $CONFIG[$key] = $localConfig.$key
-        }
-    } catch { }
 }
 
 # -- BOOTSTRAP -----------------------------------------------------------------
@@ -480,27 +463,16 @@ function New-StampedAdNotes {
     return @($stamp, $body) -join "`r`n"
 }
 
-function New-TempPassword {
-    $upper   = 'ABCDEFGHJKLMNPQRSTUVWXYZ'.ToCharArray()
-    $lower   = 'abcdefghjkmnpqrstuvwxyz'.ToCharArray()
-    $digits  = '23456789'.ToCharArray()
-    $special = '!@#$%^&*'.ToCharArray()
-    $all     = $upper + $lower + $digits + $special
-    $pwd     = @(($upper|Get-Random),($lower|Get-Random),($digits|Get-Random),($special|Get-Random))
-    for ($i = 0; $i -lt ($CONFIG.TempPasswordLength - 4); $i++) { $pwd += ($all|Get-Random) }
-    return -join ($pwd | Sort-Object { Get-Random })
-}
-
 function Get-UserAccount {
     param([string]$Username)
-    $result = @{ Success=$false; User=$null; Groups=@(); PasswordStatus=$null; Error="" }
+    $result = @{ Success=$false; User=$null; Groups=@(); Error="" }
     $nameCheck = Test-SamAccountName -Username $Username
     if (-not $nameCheck.Valid) { $result.Error=$nameCheck.Error; return $result }
     $ad = Test-ADConnectivity
     if (-not $ad.Ready) { $result.Error=$ad.Error; return $result }
     $props = @(
         'DisplayName', 'EmailAddress', 'Department', 'Title', 'DistinguishedName', 'Enabled',
-        'LockedOut', 'CannotChangePassword', 'PasswordNeverExpires', 'PasswordLastSet',
+        'LockedOut', 'PasswordNeverExpires', 'PasswordLastSet',
         'PasswordExpired', 'LastLogonDate', 'Created', 'MemberOf', 'info'
     )
     $userCmd = "Get-ADUser -Identity '$Username' -Properties $($props -join ',')"
@@ -518,7 +490,6 @@ function Get-UserAccount {
     $memberCount = @($user.MemberOf).Count
     Write-TerminalLog "Resolved $memberCount group name(s) from MemberOf (no per-group AD queries)" 'info'
     $groups = Get-GroupNamesFromMemberOf -MemberOf $user.MemberOf
-    $result.PasswordStatus = Get-UserPasswordChangeStatus -User $user
     $result.Success = $true
     $result.User = $user
     $result.Groups = $groups
@@ -628,25 +599,6 @@ function Update-ComputerNotes {
     return $result
 }
 
-function Invoke-PasswordReset {
-    param([string]$Username,[string]$NewPassword)
-    $result = @{ Success=$false; Error="" }
-    if ($NewPassword.Length -lt $CONFIG.MinPasswordLength) { $result.Error="Password must be at least $($CONFIG.MinPasswordLength) characters."; return $result }
-    $ad = Test-ADConnectivity
-    if (-not $ad.Ready) { $result.Error=$ad.Error; return $result }
-    try {
-        Invoke-LoggedAd {
-            Set-ADAccountPassword -Identity $Username -NewPassword (ConvertTo-SecureString $NewPassword -AsPlainText -Force) -Reset -ErrorAction Stop
-        } -CommandLabel "Set-ADAccountPassword -Identity '$Username' -Reset"
-        Invoke-LoggedAd {
-            Set-ADUser -Identity $Username -ChangePasswordAtLogon $true -ErrorAction Stop
-        } -CommandLabel "Set-ADUser -Identity '$Username' -ChangePasswordAtLogon `$true"
-        $result.Success=$true
-    } catch [System.UnauthorizedAccessException] { $result.Error="Access denied - no permission to reset this password."
-    } catch { $result.Error="Reset failed: $($_.Exception.Message)" }
-    return $result
-}
-
 function Invoke-AccountUnlock {
     param([string]$Username)
     $result = @{ Success=$false; Error="" }
@@ -693,94 +645,6 @@ function Get-OUPathFromDN {
     $ous = @($DN -split ',' | Where-Object { $_ -match '^OU=' } | ForEach-Object { $_ -replace '^OU=','' })
     if ($ous.Count -gt 0) { return ($ous -join ' / ') }
     return $DN
-}
-
-function Test-MustChangePasswordAtLogon {
-    param($User)
-    if ($null -eq $User.PasswordLastSet) { return $false }
-    return ($User.PasswordLastSet.ToUniversalTime().Year -le 1601)
-}
-
-function Get-AdObjectLdapPath {
-    param([Parameter(Mandatory)][string]$DistinguishedName)
-    return "LDAP://$DistinguishedName"
-}
-
-function Get-AdUserObjectSecurity {
-    param([Parameter(Mandatory)][string]$DistinguishedName)
-    $ldapPath = Get-AdObjectLdapPath -DistinguishedName $DistinguishedName
-    $entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath)
-    return $entry.ObjectSecurity
-}
-
-function Get-SelfChangePasswordAceSummary {
-    param([System.DirectoryServices.ActiveDirectorySecurity]$Acl)
-    $changePwdGuid = [Guid]'ab721a53-1e2f-11d0-9819-00aa0040529b'
-    $selfSid = 'S-1-5-10'
-    $summary = @{
-        ExplicitAllow  = $false
-        InheritedAllow = $false
-        ExplicitDeny   = $false
-        InheritedDeny  = $false
-    }
-    foreach ($ace in $Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
-        if ($ace -isnot [System.DirectoryServices.ActiveDirectoryAccessRule]) { continue }
-        if ($ace.ObjectType -ne $changePwdGuid) { continue }
-        try {
-            $sid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
-            if ($sid.Value -ne $selfSid) { continue }
-        } catch { continue }
-        if ($ace.AccessControlType -eq 'Deny') {
-            if ($ace.IsInherited) { $summary.InheritedDeny = $true } else { $summary.ExplicitDeny = $true }
-        } elseif ($ace.AccessControlType -eq 'Allow') {
-            if ($ace.IsInherited) { $summary.InheritedAllow = $true } else { $summary.ExplicitAllow = $true }
-        }
-    }
-    return $summary
-}
-
-function Get-UserPasswordChangeStatus {
-    param($User)
-    $status = @{
-        CannotChangePassword = [bool]$User.CannotChangePassword
-        MustChangeAtLogon    = (Test-MustChangePasswordAtLogon -User $User)
-        SelfChangePassword   = 'Unknown'
-        Issues               = New-Object System.Collections.Generic.List[string]
-        CanChangeOwnPassword = $true
-    }
-
-    if ($status.CannotChangePassword) {
-        [void]$status.Issues.Add('Account flag "User cannot change password" is ON (AD Users and Computers > Account tab).')
-    }
-    if (-not $status.MustChangeAtLogon) {
-        [void]$status.Issues.Add('"User must change password at next logon" is not set (temp logins may not prompt for a new password).')
-    }
-
-    try {
-        $sam = $User.SamAccountName
-        $acl = Invoke-LoggedAd {
-            Get-AdUserObjectSecurity -DistinguishedName $User.DistinguishedName
-        } -CommandLabel "DirectoryEntry.ObjectSecurity ($sam) - SELF Change Password"
-        $self = Get-SelfChangePasswordAceSummary -Acl $acl
-        if ($self.ExplicitDeny -or $self.InheritedDeny) {
-            $status.SelfChangePassword = 'Deny'
-            [void]$status.Issues.Add('SELF "Change password" is denied on this account (Security tab > SELF).')
-        } elseif ($self.ExplicitAllow) {
-            $status.SelfChangePassword = 'AllowExplicit'
-        } elseif ($self.InheritedAllow) {
-            $status.SelfChangePassword = 'AllowInherited'
-        } else {
-            $status.SelfChangePassword = 'NotAllowed'
-            [void]$status.Issues.Add('SELF does not have "Change password" allowed (Security tab > SELF > Allow Change password).')
-        }
-    } catch {
-        $status.SelfChangePassword = 'Error'
-        [void]$status.Issues.Add("Could not read security ACL: $($_.Exception.Message)")
-    }
-
-    $status.CanChangeOwnPassword = (-not $status.CannotChangePassword) -and
-        ($status.SelfChangePassword -in @('AllowExplicit', 'AllowInherited'))
-    return $status
 }
 
 # -- THEME (standard light grey - readable on any Windows theme) ---------------
@@ -1069,7 +933,7 @@ $lblStat = New-Lbl $cId "" $F.Heading $C.TextMuted 14 124
 $lblLock = New-Lbl $cId "" $F.Heading $C.Danger 120 124
 
 # Details
-$cDet = New-Card $splitUser.Panel1 "Account Details" 260
+$cDet = New-Card $splitUser.Panel1 "Account Details" 180
 function New-DR { param($card,$lbl,$y)
     New-Lbl $card $lbl $F.Small $C.TextMuted 14 $y | Out-Null
     $v=New-Lbl $card "-" $F.Small $C.TextPrimary 158 $y; $v.Size=New-Object System.Drawing.Size(220,16); return $v }
@@ -1078,26 +942,7 @@ $vLogon   = New-DR $cDet "Last Logon"         50
 $vPwdSet  = New-DR $cDet "Password Last Set"  72
 $vPwdExp  = New-DR $cDet "Password Expires"   94
 $vNvrExp  = New-DR $cDet "Pwd Never Expires"  116
-$vCantChg = New-DR $cDet "Cannot Change Pwd"  138
-$vMustChg = New-DR $cDet "Must Change Pwd"    160
-$vSelfChg = New-DR $cDet "SELF Change Pwd"    182
-$vOU      = New-DR $cDet "OU"                 204
-
-# Password reset
-$cPwd = New-Card $splitUser.Panel1 "Password Reset" 150
-New-Lbl $cPwd "Temporary Password" $F.Heading $C.TextPrimary 14 28 | Out-Null
-$txtPwd    = New-Txt   $cPwd 14 48 212 $F.Mono
-$btnGenPwd = New-Btn   $cPwd "New" $F.Small $C.Bg $C.TextPrimary 234 48 56 24 $false
-$btnGenPwd.FlatAppearance.BorderColor=$C.Border; $btnGenPwd.FlatAppearance.BorderSize=1
-$btnCpyPwd = New-Btn   $cPwd "Copy" $F.Small $C.Bg $C.TextPrimary 298 48 52 24 $false
-$btnCpyPwd.FlatAppearance.BorderColor=$C.Border; $btnCpyPwd.FlatAppearance.BorderSize=1
-$chkShow   = New-Object System.Windows.Forms.CheckBox; $chkShow.Text="Show password"
-$chkShow.Font=$F.Small; $chkShow.ForeColor=$C.TextPrimary; $chkShow.AutoSize=$true
-$chkShow.Checked=$true; $chkShow.Location=New-Object System.Drawing.Point(14,80)
-$chkShow.FlatStyle="Flat"; Set-ControlDarkStyle $chkShow $C.Card
-$cPwd.Controls.Add($chkShow)
-
-$btnRstPwd = New-Btn   $cPwd "Reset Password" $F.Heading $C.Accent ([System.Drawing.Color]::White) 14 106 344 32 $false
+$vOU      = New-DR $cDet "OU"                 138
 
 # Right - Groups
 $cGrp = New-Card $splitUser.Panel2 "Group Memberships" 395
@@ -1136,21 +981,20 @@ $btnDiag.Visible=$false
 $pnlUserTab.Controls.Add($pnlUserSearch)
 
 # -- USER TAB LOGIC ------------------------------------------------------------
-$script:CurUser=$null; $script:CurGroups=@(); $script:CurPasswordStatus=$null
+$script:CurUser=$null; $script:CurGroups=@()
 
 function Clear-UDisplay {
     $lblDN.Text="-"; $lblUN2.Text="-"; $lblMail.Text="-"; $lblDept.Text="-"
     $lblStat.Text=""; $lblLock.Text=""
     $vCreated.Text="-"; $vLogon.Text="-"; $vPwdSet.Text="-"; $vPwdExp.Text="-"
-    $vNvrExp.Text="-"; $vCantChg.Text="-"; $vMustChg.Text="-"; $vSelfChg.Text="-"; $vOU.Text="-"
-    $lstGroups.Items.Clear(); $txtPwd.Text=""; $txtUserNotes.Text=""; $txtUserNotes.Enabled=$false
-    $btnRstPwd.Enabled=$false; $btnGenPwd.Enabled=$false; $btnCpyPwd.Enabled=$false
+    $vNvrExp.Text="-"; $vOU.Text="-"
+    $lstGroups.Items.Clear(); $txtUserNotes.Text=""; $txtUserNotes.Enabled=$false
     $btnUnlock.Enabled=$false; $btnEnable.Enabled=$false; $btnRefresh.Enabled=$false; $btnUserSaveNotes.Enabled=$false; $btnDiag.Visible=$false
-    $script:CurUser=$null; $script:CurGroups=@(); $script:CurPasswordStatus=$null
+    $script:CurUser=$null; $script:CurGroups=@()
 }
 
 function Show-UData {
-    param($User, $Groups, $PasswordStatus = $null)
+    param($User, $Groups)
     $lblDN.Text  = if($User.DisplayName){$User.DisplayName}else{$User.SamAccountName}
     $lblUN2.Text = $User.SamAccountName
     $lblMail.Text= if($User.EmailAddress){$User.EmailAddress}else{"No email on file"}
@@ -1177,30 +1021,6 @@ function Show-UData {
         } catch { $vPwdExp.Text="-"; $vPwdExp.ForeColor=$C.TextPrimary }
     }
     $vNvrExp.Text  = if($User.PasswordNeverExpires){"Yes"}else{"No"}
-    $vCantChg.Text = if ($User.CannotChangePassword) { 'Yes (blocked)' } else { 'No' }
-    $vCantChg.ForeColor = if ($User.CannotChangePassword) { $C.Warning } else { $C.TextPrimary }
-
-    if ($PasswordStatus) {
-        $vMustChg.Text = if ($PasswordStatus.MustChangeAtLogon) { 'Yes' } else { 'No (may skip prompt)' }
-        $vMustChg.ForeColor = if ($PasswordStatus.MustChangeAtLogon) { $C.Success } else { $C.Warning }
-        $vSelfChg.Text = switch ($PasswordStatus.SelfChangePassword) {
-            'AllowExplicit'  { 'Allow (explicit)' }
-            'AllowInherited' { 'Allow (inherited)' }
-            'Deny'           { 'DENIED' }
-            'NotAllowed'     { 'Not allowed' }
-            'Error'          { 'Could not read' }
-            default          { '-' }
-        }
-        $vSelfChg.ForeColor = switch ($PasswordStatus.SelfChangePassword) {
-            { $_ -in @('AllowExplicit', 'AllowInherited') } { $C.Success }
-            'Deny'       { $C.Danger }
-            'NotAllowed' { $C.Warning }
-            default      { $C.TextPrimary }
-        }
-    } else {
-        $vMustChg.Text = '-'; $vSelfChg.Text = '-'
-        $vMustChg.ForeColor = $C.TextPrimary; $vSelfChg.ForeColor = $C.TextPrimary
-    }
 
     $vOU.Text = Get-OUFromDN $User.DistinguishedName
     $lstGroups.Items.Clear()
@@ -1208,22 +1028,9 @@ function Show-UData {
     else { $lstGroups.Items.Add("(no group memberships)")|Out-Null }
     $txtUserNotes.Text = if($User.info){[string]$User.info}else{""}
     $txtUserNotes.Enabled = $true
-    $btnRstPwd.Enabled = (-not $User.CannotChangePassword)
-    $btnGenPwd.Enabled = $btnRstPwd.Enabled
-    $btnCpyPwd.Enabled = $btnRstPwd.Enabled
     $btnRefresh.Enabled = $true
     $btnUserSaveNotes.Enabled = $true
-    if ($btnRstPwd.Enabled) { $txtPwd.Text = New-TempPassword }
-
-    if ($PasswordStatus -and $PasswordStatus.Issues.Count -gt 0) {
-        $hint = $PasswordStatus.Issues[0]
-        if ($PasswordStatus.Issues.Count -gt 1) { $hint += " (+$($PasswordStatus.Issues.Count - 1) more - see terminal)" }
-        foreach ($issue in $PasswordStatus.Issues) { Write-TerminalLog "Password change: $issue" 'warn' }
-        $stype = if (-not $PasswordStatus.CanChangeOwnPassword) { 'error' } else { 'warning' }
-        Set-Status $hint $stype
-    } elseif (-not $User.CannotChangePassword) {
-        Set-Status "Loaded: $($User.DisplayName)  |  $($Groups.Count) group(s)" 'success'
-    }
+    Set-Status "Loaded: $($User.DisplayName)  |  $($Groups.Count) group(s)" 'success'
 }
 
 function Invoke-USearch {
@@ -1245,8 +1052,7 @@ function Invoke-USearch {
     }
     $script:CurUser = $r.User
     $script:CurGroups = $r.Groups
-    $script:CurPasswordStatus = $r.PasswordStatus
-    Show-UData -User $r.User -Groups $r.Groups -PasswordStatus $r.PasswordStatus
+    Show-UData -User $r.User -Groups $r.Groups
     Write-TerminalLog ("Lookup complete: $($r.Groups.Count) group(s), total {0:N0} ms" -f $sw.ElapsedMilliseconds) 'ok'
 }
 
@@ -1269,34 +1075,6 @@ $btnUserSaveNotes.Add_Click({
         Set-Status $r.Error "error"
         $btnUserSaveNotes.Enabled=$true
     }
-})
-$btnGenPwd.Add_Click({ $txtPwd.Text=New-TempPassword })
-$btnCpyPwd.Add_Click({ if($txtPwd.Text){ [System.Windows.Forms.Clipboard]::SetText($txtPwd.Text); Set-Status "Password copied to clipboard." "info" } })
-$chkShow.Add_CheckedChanged({ $txtPwd.UseSystemPasswordChar=-not $chkShow.Checked })
-
-$btnRstPwd.Add_Click({
-    if(-not $script:CurUser){return}
-    $u=$script:CurUser.SamAccountName; $p=$txtPwd.Text
-    if([string]::IsNullOrWhiteSpace($p)){Set-Status "Please generate a temporary password first." "error";return}
-    $c=[System.Windows.Forms.MessageBox]::Show(
-        "Reset password for $($script:CurUser.DisplayName) ($u)?`n`nTemporary password:  $p`n`nUser must change this at next sign-in.",
-        "Confirm Password Reset",[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Question)
-    if($c -ne "Yes"){return}
-    $btnRstPwd.Enabled=$false; Set-Status "Resetting password for $u..." "info"
-    $r=Invoke-PasswordReset -Username $u -NewPassword $p
-    if($r.Success){
-        Set-Status "Password reset for $($script:CurUser.DisplayName)." "success"
-        $extra = ''
-        if ($script:CurPasswordStatus -and -not $script:CurPasswordStatus.CanChangeOwnPassword) {
-            $extra = "`n`nNote: This account may still be unable to change its own password (check Cannot Change Pwd / SELF Change Pwd in Account Details)."
-        } elseif ($script:CurPasswordStatus -and $script:CurPasswordStatus.SelfChangePassword -in @('NotAllowed', 'Deny')) {
-            $extra = "`n`nIf the user gets Access Denied when changing password: AD Users and Computers > Security > SELF > check Allow for Change password."
-        }
-        [System.Windows.Forms.MessageBox]::Show(
-            "Password reset successfully.`n`nUsername:        $u`nTemp Password:  $p`n`nUser must change password at next logon (domain PC: Ctrl+Alt+Del > Change a password).$extra",
-            "Reset Complete",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information)|Out-Null
-        $txtPwd.Text=New-TempPassword; $btnRstPwd.Enabled=$true
-    } else { Set-Status $r.Error "error"; $btnRstPwd.Enabled=$true }
 })
 
 $btnUnlock.Add_Click({

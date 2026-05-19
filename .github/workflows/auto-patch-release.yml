@@ -78,7 +78,7 @@ jobs:
         shell: pwsh
         run: |
           $tag = '${{ steps.version.outputs.tag }}'
-          Compress-Archive -Path ADTools.ps1, config.json -DestinationPath "ADTools-$tag.zip" -Force
+          Compress-Archive -Path ADTools.ps1 -DestinationPath "ADTools-$tag.zip" -Force
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
