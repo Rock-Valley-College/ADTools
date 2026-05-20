@@ -78,6 +78,31 @@ if ($PSCommandPath) {
     }
 }
 
+# -- CONFIG --------------------------------------------------------------------
+$CONFIG = @{
+    StaleComputerDays       = 90
+    UserExtensionAttributes = @{
+        extensionAttribute10 = 'Personal email'
+    }
+}
+$configPath = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'config.json' } else { $null }
+if ($configPath -and (Test-Path -LiteralPath $configPath)) {
+    try {
+        $localConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        foreach ($key in $localConfig.PSObject.Properties.Name) {
+            if ($key -eq '_comment') { continue }
+            if ($key -eq 'UserExtensionAttributes' -and $localConfig.UserExtensionAttributes) {
+                $CONFIG.UserExtensionAttributes = @{}
+                foreach ($p in $localConfig.UserExtensionAttributes.PSObject.Properties) {
+                    $CONFIG.UserExtensionAttributes[$p.Name] = [string]$p.Value
+                }
+                continue
+            }
+            $CONFIG[$key] = $localConfig.$key
+        }
+    } catch { }
+}
+
 # -- BOOTSTRAP -----------------------------------------------------------------
 $script:StartupOk = $false
 try {
@@ -426,6 +451,150 @@ function Test-SamAccountName {
     return @{ Valid=$true; Error="" }
 }
 
+function Resolve-UserSearchIdentity {
+    param([string]$Query)
+    $q = $Query.Trim()
+    if ([string]::IsNullOrWhiteSpace($q)) {
+        return @{ Valid=$false; SamAccountName=''; Error='Please enter a username or email.' }
+    }
+    if ($q -match '@') {
+        $ad = Test-ADConnectivity
+        if (-not $ad.Ready) { return @{ Valid=$false; SamAccountName=''; Error=$ad.Error } }
+        $escaped = $q.Replace("'", "''")
+        $filter = "(UserPrincipalName -eq '$escaped') -or (mail -eq '$escaped')"
+        try {
+            $matches = @(Invoke-LoggedAd {
+                Get-ADUser -Filter $filter -Properties SamAccountName -ErrorAction Stop
+            } -CommandLabel "Get-ADUser -Filter (UPN or mail = '$escaped')")
+        } catch {
+            return @{ Valid=$false; SamAccountName=''; Error="AD lookup failed: $($_.Exception.Message)" }
+        }
+        if ($matches.Count -eq 0) {
+            return @{ Valid=$false; SamAccountName=''; Error="No account found for '$q'." }
+        }
+        if ($matches.Count -gt 1) {
+            $names = ($matches.SamAccountName | Sort-Object) -join ', '
+            return @{ Valid=$false; SamAccountName=''; Error="Multiple accounts match '$q': $names" }
+        }
+        return @{ Valid=$true; SamAccountName=$matches[0].SamAccountName; Error='' }
+    }
+    $nameCheck = Test-SamAccountName -Username $q
+    if (-not $nameCheck.Valid) { return @{ Valid=$false; SamAccountName=''; Error=$nameCheck.Error } }
+    return @{ Valid=$true; SamAccountName=$q; Error='' }
+}
+
+function Format-DateOrDash {
+    param($Value)
+    if ($null -eq $Value) { return '-' }
+    try { return ([datetime]$Value).ToString('MM/dd/yyyy  h:mm tt') } catch { return '-' }
+}
+
+function Format-UserPhone {
+    param($User)
+    $parts = @()
+    if ($User.OfficePhone) { $parts += "Office: $($User.OfficePhone)" }
+    if ($User.MobilePhone) { $parts += "Mobile: $($User.MobilePhone)" }
+    if ($User.TelephoneNumber) { $parts += "Tel: $($User.TelephoneNumber)" }
+    if ($parts.Count -eq 0) { return '-' }
+    return $parts -join '  |  '
+}
+
+function Get-ComputerActivityStatus {
+    param($Computer, [int]$StaleDays)
+    if ($StaleDays -lt 1) { $StaleDays = 90 }
+    $last = $Computer.LastLogonDate
+    if ($null -eq $last) {
+        return @{ Text = 'No last logon on record'; IsStale = $true }
+    }
+    try {
+        $days = [int][Math]::Floor(((Get-Date) - [datetime]$last).TotalDays)
+    } catch {
+        return @{ Text = '-'; IsStale = $false }
+    }
+    if ($days -ge $StaleDays) {
+        return @{ Text = "Inactive ($days days since last logon)"; IsStale = $true }
+    }
+    return @{ Text = "Active ($days days since last logon)"; IsStale = $false }
+}
+
+function Get-ComputerLapsInfo {
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        $Computer = $null
+    )
+    $info = @{
+        Available  = $false
+        Password   = $null
+        Expiration = $null
+        Source     = ''
+        Message    = ''
+    }
+    $lapsProps = @(
+        'msLAPS-Password', 'msLAPS-PasswordExpirationTime',
+        'msLAPS-EncryptedPassword', 'msLAPS-EncryptedPasswordExpirationTime',
+        'ms-Mcs-AdmPwd', 'ms-Mcs-AdmPwdExpirationTime'
+    )
+    $obj = $Computer
+    if (-not $obj) {
+        try {
+            $obj = Invoke-LoggedAd {
+                Get-ADComputer -Identity $ComputerName -Properties $lapsProps -ErrorAction Stop
+            } -CommandLabel "Get-ADComputer -Identity '$ComputerName' -Properties (LAPS)"
+        } catch {
+            $info.Message = "Could not read LAPS attributes: $($_.Exception.Message)"
+            return $info
+        }
+    }
+    $winPwd = $obj.'msLAPS-Password'
+    if ($winPwd) {
+        $info.Available = $true
+        $info.Password = [string]$winPwd
+        $info.Source = 'Windows LAPS'
+        if ($obj.'msLAPS-PasswordExpirationTime') {
+            try { $info.Expiration = [datetime]$obj.'msLAPS-PasswordExpirationTime' } catch { }
+        }
+        return $info
+    }
+    $legacyPwd = $obj.'ms-Mcs-AdmPwd'
+    if ($legacyPwd) {
+        $info.Available = $true
+        $info.Password = [string]$legacyPwd
+        $info.Source = 'Legacy LAPS'
+        if ($obj.'ms-Mcs-AdmPwdExpirationTime') {
+            try { $info.Expiration = [datetime]::FromFileTime([Int64]$obj.'ms-Mcs-AdmPwdExpirationTime') } catch { }
+        }
+        return $info
+    }
+    if ($obj.'msLAPS-EncryptedPassword') {
+        if (Get-Command Get-LapsADPassword -ErrorAction SilentlyContinue) {
+            try {
+                $plain = $null
+                try {
+                    $plain = Get-LapsADPassword -Identity $ComputerName -AsPlainText -ErrorAction Stop
+                } catch {
+                    $plain = Get-LapsADPassword -ComputerName $ComputerName -AsPlainText -ErrorAction Stop
+                }
+                if ($plain) {
+                    $info.Available = $true
+                    $info.Password = [string]$plain
+                    $info.Source = 'Windows LAPS (encrypted)'
+                    if ($obj.'msLAPS-EncryptedPasswordExpirationTime') {
+                        try { $info.Expiration = [datetime]$obj.'msLAPS-EncryptedPasswordExpirationTime' } catch { }
+                    }
+                    return $info
+                }
+            } catch {
+                $info.Message = "Encrypted LAPS password present; read failed: $($_.Exception.Message)"
+                return $info
+            }
+        }
+        $info.Message = 'Encrypted LAPS password (requires Get-LapsADPassword / LAPS read rights).'
+        return $info
+    }
+    $info.Message = 'No LAPS password stored on this computer.'
+    return $info
+}
+
 function Test-ComputerAccountName {
     param([string]$ComputerName)
     if ([string]::IsNullOrWhiteSpace($ComputerName)) { return @{ Valid=$false; Error="Please enter a computer name." } }
@@ -463,25 +632,69 @@ function New-StampedAdNotes {
     return @($stamp, $body) -join "`r`n"
 }
 
+function Get-ExtensionAttributePropertyNames {
+    return 1..15 | ForEach-Object { "extensionAttribute$_" }
+}
+
+function Get-UserExtensionAttributeDefinitions {
+    $defs = New-Object System.Collections.Generic.List[object]
+    $raw = $CONFIG['UserExtensionAttributes']
+    if ($raw) {
+        $pairs = @()
+        if ($raw -is [hashtable]) {
+            foreach ($k in $raw.Keys) { $pairs += [pscustomobject]@{ Name = [string]$k; Label = [string]$raw[$k] } }
+        } elseif ($raw -is [pscustomobject]) {
+            foreach ($p in $raw.PSObject.Properties) {
+                $pairs += [pscustomobject]@{ Name = [string]$p.Name; Label = [string]$p.Value }
+            }
+        }
+        foreach ($pair in ($pairs | Sort-Object {
+            if ($_.Name -match '^extensionAttribute(\d+)$') { [int]$Matches[1] } else { 999 }
+        })) {
+            if ($pair.Name -match '^extensionAttribute(\d+)$') {
+                [void]$defs.Add([pscustomobject]@{ Attribute = $pair.Name; Label = $pair.Label })
+            }
+        }
+    }
+    if ($defs.Count -eq 0) {
+        [void]$defs.Add([pscustomobject]@{ Attribute = 'extensionAttribute10'; Label = 'Personal email' })
+    }
+    return @($defs)
+}
+
+function Get-ExtensionAttributeValue {
+    param($User, [string]$Attribute)
+    if (-not $User -or [string]::IsNullOrWhiteSpace($Attribute)) { return '' }
+    try {
+        $prop = $User.PSObject.Properties[$Attribute]
+        if (-not $prop -or $null -eq $prop.Value) { return '' }
+        return [string]$prop.Value
+    } catch { return '' }
+}
+
 function Get-UserAccount {
     param([string]$Username)
     $result = @{ Success=$false; User=$null; Groups=@(); PasswordStatus=$null; Error="" }
-    $nameCheck = Test-SamAccountName -Username $Username
-    if (-not $nameCheck.Valid) { $result.Error=$nameCheck.Error; return $result }
+    $resolved = Resolve-UserSearchIdentity -Query $Username
+    if (-not $resolved.Valid) { $result.Error=$resolved.Error; return $result }
+    $sam = $resolved.SamAccountName
     $ad = Test-ADConnectivity
     if (-not $ad.Ready) { $result.Error=$ad.Error; return $result }
     $props = @(
-        'DisplayName', 'EmailAddress', 'Department', 'Title', 'DistinguishedName', 'Enabled',
+        'DisplayName', 'EmailAddress', 'UserPrincipalName', 'Department', 'Title', 'Manager',
+        'Office', 'OfficePhone', 'MobilePhone', 'TelephoneNumber', 'DistinguishedName', 'Enabled',
         'LockedOut', 'CannotChangePassword', 'PasswordNeverExpires', 'PasswordLastSet',
-        'PasswordExpired', 'pwdLastSet', 'LastLogonDate', 'Created', 'MemberOf', 'info'
-    )
-    $userCmd = "Get-ADUser -Identity '$Username' -Properties $($props -join ',')"
+        'PasswordExpired', 'pwdLastSet', 'LastLogonDate', 'Created', 'Modified',
+        'AccountExpirationDate', 'badPwdCount', 'LastBadPasswordAttempt', 'AccountLockoutTime',
+        'MemberOf', 'info'
+    ) + @(Get-ExtensionAttributePropertyNames)
+    $userCmd = "Get-ADUser -Identity '$sam' -Properties $($props -join ',')"
     try {
         $user = Invoke-LoggedAd {
-            Get-ADUser -Identity $Username -Properties $props -ErrorAction Stop
+            Get-ADUser -Identity $sam -Properties $props -ErrorAction Stop
         } -CommandLabel $userCmd
     } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
-        $result.Error = "No account found for '$Username'."
+        $result.Error = "No account found for '$sam'."
         return $result
     } catch {
         $result.Error = "AD lookup failed: $($_.Exception.Message)"
@@ -494,6 +707,9 @@ function Get-UserAccount {
     $result.Success = $true
     $result.User = $user
     $result.Groups = $groups
+    if ($Username.Trim() -ne $sam) {
+        Write-TerminalLog "Resolved search '$Username' to samAccountName '$sam'" 'info'
+    }
     return $result
 }
 
@@ -544,7 +760,7 @@ function Get-NameFromDN {
 
 function Get-ComputerAccount {
     param([string]$ComputerName)
-    $result = @{ Success=$false; Computer=$null; Groups=@(); IPAddress=''; Error="" }
+    $result = @{ Success=$false; Computer=$null; Groups=@(); IPAddress=''; Laps=$null; Error="" }
     $nameCheck = Test-ComputerAccountName -ComputerName $ComputerName
     if (-not $nameCheck.Valid) { $result.Error=$nameCheck.Error; return $result }
     $ad = Test-ADConnectivity
@@ -573,6 +789,7 @@ function Get-ComputerAccount {
     $result.Computer = $computer
     $result.Groups = Get-GroupNamesFromMemberOf -MemberOf $computer.MemberOf
     $result.IPAddress = Resolve-ComputerIPv4Address -Computer $computer
+    $result.Laps = Get-ComputerLapsInfo -ComputerName $name
     return $result
 }
 
@@ -715,9 +932,6 @@ function Get-UserPasswordChangeStatus {
 
     if ($status.CannotChangePassword) {
         [void]$status.Issues.Add('Account flag "User cannot change password" is ON (AD Users and Computers > Account tab).')
-    }
-    if (-not $status.MustChangeAtLogon) {
-        [void]$status.Issues.Add('"User must change password at next logon" is not set.')
     }
 
     try {
@@ -1009,7 +1223,7 @@ function New-Memo { param($parent,$x,$y,$w,$h)
 # Fill first, then Top (search bar) so the bar never sits under the split view
 $pnlUserTab.Controls.Add($splitUser)
 
-New-Lbl $pnlUserSearch "Username" $F.Heading $C.TextPrimary 12 18 | Out-Null
+New-Lbl $pnlUserSearch "User / email" $F.Heading $C.TextPrimary 12 18 | Out-Null
 $txtUserSearch = New-Txt $pnlUserSearch 98 14 320 $F.Mono
 $btnUserSearch = New-Btn $pnlUserSearch "Look Up" $F.Heading $C.Accent ([System.Drawing.Color]::White) 430 14 86 28
 
@@ -1022,18 +1236,19 @@ function New-Card {
     return $card
 }
 
-# Identity (Dock Top: add top-to-bottom in order)
-$cId = New-Card $splitUser.Panel1 "Identity" 155
+# Identity (Dock Top: first added = bottom of stack)
+$cId = New-Card $splitUser.Panel1 "Identity" 175
 $lblDN   = New-Lbl $cId "-" (New-Object System.Drawing.Font("Segoe UI",15,[System.Drawing.FontStyle]::Bold)) $C.TextPrimary 14 28
 $lblDN.Size=New-Object System.Drawing.Size(360,30)
 $lblUN2  = New-Lbl $cId "-" $F.MonoSm $C.Accent 14 62
-$lblMail = New-Lbl $cId "-" $F.Small $C.TextMuted 14 82
-$lblDept = New-Lbl $cId "-" $F.Small $C.TextMuted 14 100
-$lblStat = New-Lbl $cId "" $F.Heading $C.TextMuted 14 124
-$lblLock = New-Lbl $cId "" $F.Heading $C.Danger 120 124
+$lblUPN  = New-Lbl $cId "-" $F.Small $C.TextMuted 14 80
+$lblMail = New-Lbl $cId "-" $F.Small $C.TextMuted 14 98
+$lblDept = New-Lbl $cId "-" $F.Small $C.TextMuted 14 116
+$lblStat = New-Lbl $cId "" $F.Heading $C.TextMuted 14 140
+$lblLock = New-Lbl $cId "" $F.Heading $C.Danger 120 140
 
 # Details
-$cDet = New-Card $splitUser.Panel1 "Account Details" 290
+$cDet = New-Card $splitUser.Panel1 "Account Details" 458
 function New-DR { param($card,$lbl,$y)
     New-Lbl $card $lbl $F.Small $C.TextMuted 14 $y | Out-Null
     $v=New-Lbl $card "-" $F.Small $C.TextPrimary 158 $y $false; $v.Size=New-Object System.Drawing.Size(220,16); return $v }
@@ -1045,9 +1260,33 @@ $vNvrExp  = New-DR $cDet "Pwd Never Expires"  116
 $vCantChg = New-DR $cDet "Cannot Change Pwd"  138
 $vMustChg = New-DR $cDet "Must Change Pwd"    160
 $vSelfChg = New-DR $cDet "SELF Change Pwd"    182
-$vOU      = New-DR $cDet "OU"                 204
-$vFullDN  = New-DR $cDet "Full DN"            226
+$vModified = New-DR $cDet "Last Modified"     204
+$vAcctExp  = New-DR $cDet "Account Expires"   226
+$vBadPwd   = New-DR $cDet "Bad Pwd Count"     248
+$vLastBad  = New-DR $cDet "Last Bad Pwd"      270
+$vLockTime = New-DR $cDet "Lockout Time"       292
+$vManager  = New-DR $cDet "Manager"           314
+$vOffice   = New-DR $cDet "Office"            336
+$vPhone    = New-DR $cDet "Phone"             358
+$vOU      = New-DR $cDet "OU"                 380
+$vFullDN  = New-DR $cDet "Full DN"            402
 $vFullDN.Size = New-Object System.Drawing.Size(220,48)
+
+$script:UserExtAttrFields = @()
+$extDefs = Get-UserExtensionAttributeDefinitions
+$extCardHeight = [Math]::Max(58, 28 + ($extDefs.Count * 22) + 14)
+$cExt = New-Card $splitUser.Panel1 "Provisioning (extension attributes)" $extCardHeight
+$extY = 28
+foreach ($extDef in $extDefs) {
+    $vExt = New-DR $cExt $extDef.Label $extY
+    $vExt.Size = New-Object System.Drawing.Size(220, 16)
+    $script:UserExtAttrFields += [pscustomobject]@{
+        Attribute  = $extDef.Attribute
+        Label      = $extDef.Label
+        ValueLabel = $vExt
+    }
+    $extY += 22
+}
 
 # Right - Groups
 $cGrp = New-Card $splitUser.Panel2 "Group Memberships" 395
@@ -1072,14 +1311,16 @@ $cUserNotes.Add_Resize({ Update-UserNotesLayout })
 $splitUser.Add_SplitterMoved({ Update-UserNotesLayout })
 
 # Right - Actions
-$cAct = New-Card $splitUser.Panel2 "Actions" 120
+$cAct = New-Card $splitUser.Panel2 "Actions" 168
 $btnUnlock  = New-Btn $cAct "Unlock Account"    $F.Heading $C.Bg $C.TextPrimary  14  30 150 34 $false
 $btnUnlock.FlatAppearance.BorderColor=$C.Warning; $btnUnlock.FlatAppearance.BorderSize=1
 $btnEnable  = New-Btn $cAct "Enable Account"     $F.Heading $C.Bg $C.TextPrimary 176 30 150 34 $false
 $btnEnable.FlatAppearance.BorderColor=$C.Success; $btnEnable.FlatAppearance.BorderSize=1
 $btnRefresh = New-Btn $cAct "Refresh"             $F.Heading $C.Bg $C.TextPrimary 338 30 100 34 $false
 $btnRefresh.FlatAppearance.BorderColor=$C.Border; $btnRefresh.FlatAppearance.BorderSize=1
-$btnDiag    = New-Btn $cAct "Diagnose Lockout"   $F.Heading $C.Bg $C.TextPrimary   14 74 180 34 $false
+$btnUserCopy = New-Btn $cAct "Copy Summary"      $F.Heading $C.Bg $C.TextPrimary  14 74 150 34 $false
+$btnUserCopy.FlatAppearance.BorderColor=$C.Border; $btnUserCopy.FlatAppearance.BorderSize=1
+$btnDiag    = New-Btn $cAct "Diagnose Lockout"   $F.Heading $C.Bg $C.TextPrimary 176 74 180 34 $false
 $btnDiag.FlatAppearance.BorderColor=$C.Danger; $btnDiag.FlatAppearance.BorderSize=1
 $btnDiag.Visible=$false
 
@@ -1089,19 +1330,94 @@ $pnlUserTab.Controls.Add($pnlUserSearch)
 $script:CurUser=$null; $script:CurGroups=@(); $script:CurPasswordStatus=$null
 
 function Clear-UDisplay {
-    $lblDN.Text="-"; $lblUN2.Text="-"; $lblMail.Text="-"; $lblDept.Text="-"
+    $lblDN.Text="-"; $lblUN2.Text="-"; $lblUPN.Text="-"; $lblMail.Text="-"; $lblDept.Text="-"
     $lblStat.Text=""; $lblLock.Text=""
     $vCreated.Text="-"; $vLogon.Text="-"; $vPwdSet.Text="-"; $vPwdExp.Text="-"
-    $vNvrExp.Text="-"; $vCantChg.Text="-"; $vMustChg.Text="-"; $vSelfChg.Text="-"; $vOU.Text="-"; $vFullDN.Text="-"
+    $vNvrExp.Text="-"; $vCantChg.Text="-"; $vMustChg.Text="-"; $vSelfChg.Text="-"
+    $vModified.Text="-"; $vAcctExp.Text="-"; $vBadPwd.Text="-"; $vLastBad.Text="-"; $vLockTime.Text="-"
+    $vManager.Text="-"; $vOffice.Text="-"; $vPhone.Text="-"; $vOU.Text="-"; $vFullDN.Text="-"
     $lstGroups.Items.Clear(); $txtUserNotes.Text=""; $txtUserNotes.Enabled=$false
-    $btnUnlock.Enabled=$false; $btnEnable.Enabled=$false; $btnRefresh.Enabled=$false; $btnUserSaveNotes.Enabled=$false; $btnDiag.Visible=$false
+    $btnUnlock.Enabled=$false; $btnEnable.Enabled=$false; $btnRefresh.Enabled=$false
+    $btnUserSaveNotes.Enabled=$false; $btnUserCopy.Enabled=$false; $btnDiag.Visible=$false
+    foreach ($extField in $script:UserExtAttrFields) { $extField.ValueLabel.Text = '-' }
     $script:CurUser=$null; $script:CurGroups=@(); $script:CurPasswordStatus=$null
+}
+
+function Set-UserExtensionFields {
+    param($User)
+    foreach ($extField in $script:UserExtAttrFields) {
+        $val = Get-ExtensionAttributeValue -User $User -Attribute $extField.Attribute
+        if ([string]::IsNullOrWhiteSpace($val)) {
+            $extField.ValueLabel.Text = '-'
+            $extField.ValueLabel.ForeColor = $C.TextMuted
+        } else {
+            $extField.ValueLabel.Text = $val
+            $extField.ValueLabel.ForeColor = $C.TextPrimary
+        }
+    }
+}
+
+function Get-UserSummaryText {
+    if (-not $script:CurUser) { return '' }
+    $u = $script:CurUser
+    $ps = $script:CurPasswordStatus
+    $mustChg = if ($ps) { if ($ps.MustChangeAtLogon) { 'Yes' } else { 'No' } } else { '-' }
+    $selfChg = if ($ps) {
+        switch ($ps.SelfChangePassword) {
+            'AllowExplicit'  { 'Allow (explicit)' }
+            'AllowInherited' { 'Allow (inherited)' }
+            'Deny'           { 'DENIED' }
+            'NotAllowed'     { 'Not allowed' }
+            'Error'          { 'Could not read' }
+            default          { '-' }
+        }
+    } else { '-' }
+    $acctExp = '-'
+    if ($u.AccountExpirationDate) {
+        try {
+            $exp = [datetime]$u.AccountExpirationDate
+            if ($exp.Year -gt 1601 -and $exp.Year -lt 9000) { $acctExp = $exp.ToString('MM/dd/yyyy') }
+        } catch { }
+    }
+    $lines = @(
+        "User: $($u.DisplayName) ($($u.SamAccountName))"
+        "UPN: $(if($u.UserPrincipalName){$u.UserPrincipalName}else{'-'})"
+        "Email: $(if($u.EmailAddress){$u.EmailAddress}else{'-'})"
+        "Title/Dept: $(if($u.Title){$u.Title}else{'-'}) / $(if($u.Department){$u.Department}else{'-'})"
+        "Enabled: $($u.Enabled)  |  Locked: $($u.LockedOut)"
+        "Manager: $(if($u.Manager){Get-NameFromDN $u.Manager}else{'-'})"
+        "Office: $(if($u.Office){$u.Office}else{'-'})"
+        "Phone: $(Format-UserPhone $u)"
+    )
+    foreach ($extField in $script:UserExtAttrFields) {
+        $extVal = Get-ExtensionAttributeValue -User $u -Attribute $extField.Attribute
+        if ([string]::IsNullOrWhiteSpace($extVal)) { $extVal = '-' }
+        $lines += "$($extField.Label): $extVal"
+    }
+    $lines += @(
+        "OU: $(Get-OUPathFromDN $u.DistinguishedName)"
+        "Created: $(Format-DateOrNever $u.Created)"
+        "Last Logon: $(Format-DateOrNever $u.LastLogonDate)"
+        "Last Modified: $(Format-DateOrDash $u.Modified)"
+        "Account Expires: $acctExp"
+        "Password Last Set: $(Format-DateOrNever $u.PasswordLastSet)"
+        "Must Change Pwd: $mustChg"
+        "Cannot Change Pwd: $(if($u.CannotChangePassword){'Yes'}else{'No'})"
+        "SELF Change Pwd: $selfChg"
+        "Bad Pwd Count: $($u.badPwdCount)"
+        "Last Bad Pwd: $(Format-DateOrDash $u.LastBadPasswordAttempt)"
+        "Lockout Time: $(Format-DateOrDash $u.AccountLockoutTime)"
+        "Groups: $($script:CurGroups.Count)"
+        "Notes: $($txtUserNotes.Text)"
+    )
+    return $lines -join "`r`n"
 }
 
 function Show-UData {
     param($User, $Groups, $PasswordStatus = $null)
     $lblDN.Text  = if($User.DisplayName){$User.DisplayName}else{$User.SamAccountName}
     $lblUN2.Text = $User.SamAccountName
+    $lblUPN.Text = if($User.UserPrincipalName){"UPN: $($User.UserPrincipalName)"}else{"No UPN on file"}
     $lblMail.Text= if($User.EmailAddress){$User.EmailAddress}else{"No email on file"}
     $dp=@(); if($User.Title){$dp+=$User.Title}; if($User.Department){$dp+=$User.Department}
     $lblDept.Text= if($dp){$dp -join "  |  "}else{"No dept/title on file"}
@@ -1131,7 +1447,7 @@ function Show-UData {
 
     if ($PasswordStatus) {
         $vMustChg.Text = if ($PasswordStatus.MustChangeAtLogon) { 'Yes' } else { 'No' }
-        $vMustChg.ForeColor = if ($PasswordStatus.MustChangeAtLogon) { $C.Success } else { $C.Warning }
+        $vMustChg.ForeColor = $C.TextPrimary
         $vSelfChg.Text = switch ($PasswordStatus.SelfChangePassword) {
             'AllowExplicit'  { 'Allow (explicit)' }
             'AllowInherited' { 'Allow (inherited)' }
@@ -1151,6 +1467,41 @@ function Show-UData {
         $vMustChg.ForeColor = $C.TextPrimary; $vSelfChg.ForeColor = $C.TextPrimary
     }
 
+    $vModified.Text = Format-DateOrDash $User.Modified
+    $vModified.ForeColor = $C.TextPrimary
+    if ($User.AccountExpirationDate) {
+        try {
+            $exp = [datetime]$User.AccountExpirationDate
+            if ($exp.Year -gt 1601 -and $exp.Year -lt 9000) {
+                $vAcctExp.Text = $exp.ToString('MM/dd/yyyy')
+                $vAcctExp.ForeColor = if ($exp -lt (Get-Date)) { $C.Danger } else { $C.TextPrimary }
+            } else {
+                $vAcctExp.Text = 'Never'
+                $vAcctExp.ForeColor = $C.TextMuted
+            }
+        } catch {
+            $vAcctExp.Text = '-'; $vAcctExp.ForeColor = $C.TextPrimary
+        }
+    } else {
+        $vAcctExp.Text = 'Never'
+        $vAcctExp.ForeColor = $C.TextMuted
+    }
+    $vBadPwd.Text = [string]$User.badPwdCount
+    $vBadPwd.ForeColor = if ($User.badPwdCount -ge 3) { $C.Warning } else { $C.TextPrimary }
+    $vLastBad.Text = Format-DateOrDash $User.LastBadPasswordAttempt
+    $vLastBad.ForeColor = $C.TextPrimary
+    if ($User.LockedOut -and $User.AccountLockoutTime) {
+        $vLockTime.Text = Format-DateOrDash $User.AccountLockoutTime
+        $vLockTime.ForeColor = $C.Danger
+    } else {
+        $vLockTime.Text = if ($User.LockedOut) { 'Locked (time not set on this DC)' } else { '-' }
+        $vLockTime.ForeColor = $C.TextPrimary
+    }
+    $vManager.Text = if ($User.Manager) { Get-NameFromDN $User.Manager } else { '-' }
+    $vOffice.Text = if ($User.Office) { [string]$User.Office } else { '-' }
+    $vPhone.Text = Format-UserPhone $User
+    Set-UserExtensionFields -User $User
+
     $vOU.Text = Get-OUFromDN $User.DistinguishedName
     $vFullDN.Text = $User.DistinguishedName
     $lstGroups.Items.Clear()
@@ -1160,6 +1511,7 @@ function Show-UData {
     $txtUserNotes.Enabled = $true
     $btnRefresh.Enabled = $true
     $btnUserSaveNotes.Enabled = $true
+    $btnUserCopy.Enabled = $true
     if ($PasswordStatus -and $PasswordStatus.Issues.Count -gt 0) {
         $hint = $PasswordStatus.Issues[0]
         if ($PasswordStatus.Issues.Count -gt 1) { $hint += " (+$($PasswordStatus.Issues.Count - 1) more - see terminal)" }
@@ -1249,6 +1601,10 @@ $btnEnable.Add_Click({
 $btnDiag.Add_Click({
     if($script:CurUser){ $txtLockoutUser.Text=$script:CurUser.SamAccountName; Switch-AppTab -Name Lockout }
 })
+$btnUserCopy.Add_Click({
+    $summary = Get-UserSummaryText
+    if($summary){ [System.Windows.Forms.Clipboard]::SetText($summary); Set-Status "User summary copied to clipboard." "info" }
+})
 
 # ==============================================================================
 # TAB 2 - COMPUTER
@@ -1277,26 +1633,28 @@ New-Lbl $pnlComputerSearch "Computer" $F.Heading $C.TextPrimary 12 18 | Out-Null
 $txtComputerSearch = New-Txt $pnlComputerSearch 98 14 320 $F.Mono
 $btnComputerSearch = New-Btn $pnlComputerSearch "Look Up" $F.Heading $C.Accent ([System.Drawing.Color]::White) 430 14 86 28
 
-$cCompId = New-Card $splitComputer.Panel1 "Identity" 155
+$cCompId = New-Card $splitComputer.Panel1 "Identity" 172
 $lblCompName = New-Lbl $cCompId "-" (New-Object System.Drawing.Font("Segoe UI",15,[System.Drawing.FontStyle]::Bold)) $C.TextPrimary 14 28
 $lblCompName.Size=New-Object System.Drawing.Size(360,30)
 $lblCompDns  = New-Lbl $cCompId "-" $F.MonoSm $C.Accent 14 62
 $lblCompDesc = New-Lbl $cCompId "-" $F.Small $C.TextMuted 14 84
 $lblCompLoc  = New-Lbl $cCompId "-" $F.Small $C.TextMuted 14 104
-$lblCompStat = New-Lbl $cCompId "" $F.Heading $C.TextMuted 14 128
+$lblCompStale = New-Lbl $cCompId "-" $F.Small $C.TextMuted 14 122
+$lblCompStat = New-Lbl $cCompId "" $F.Heading $C.TextMuted 14 146
 
-$cCompDet = New-Card $splitComputer.Panel1 "Computer Details" 302
+$cCompDet = New-Card $splitComputer.Panel1 "Computer Details" 324
 $vCompOU      = New-DR $cCompDet "OU Path"            28
 $vCompIP      = New-DR $cCompDet "IP Address"         50
-$vCompOS      = New-DR $cCompDet "Operating System"   72
-$vCompOSVer   = New-DR $cCompDet "OS Version"         94
-$vCompLogon   = New-DR $cCompDet "Last Logon"         116
-$vCompPwdSet  = New-DR $cCompDet "Pwd Last Set"       138
-$vCompCreated = New-DR $cCompDet "Created"            160
-$vCompChanged = New-DR $cCompDet "Modified"           182
-$vCompManaged = New-DR $cCompDet "Managed By"         204
-$vCompDN      = New-DR $cCompDet "DN"                 226
-foreach ($compValue in @($vCompOU,$vCompIP,$vCompOS,$vCompOSVer,$vCompLogon,$vCompPwdSet,$vCompCreated,$vCompChanged,$vCompManaged)) {
+$vCompLoc     = New-DR $cCompDet "Physical Location"  72
+$vCompOS      = New-DR $cCompDet "Operating System"   94
+$vCompOSVer   = New-DR $cCompDet "OS Version"         116
+$vCompLogon   = New-DR $cCompDet "Last Logon"         138
+$vCompPwdSet  = New-DR $cCompDet "Pwd Last Set"       160
+$vCompCreated = New-DR $cCompDet "Created"            182
+$vCompChanged = New-DR $cCompDet "Modified"           204
+$vCompManaged = New-DR $cCompDet "Managed By"         226
+$vCompDN      = New-DR $cCompDet "DN"                 248
+foreach ($compValue in @($vCompOU,$vCompIP,$vCompLoc,$vCompOS,$vCompOSVer,$vCompLogon,$vCompPwdSet,$vCompCreated,$vCompChanged,$vCompManaged)) {
     $compValue.Size = New-Object System.Drawing.Size(360,16)
 }
 $vCompDN.Size = New-Object System.Drawing.Size(360,48)
@@ -1321,6 +1679,18 @@ $lblComputerNotesHint = New-Lbl $cCompNotes "Updates the 'Notes last updated by'
 $cCompNotes.Add_Resize({ Update-ComputerNotesLayout })
 $splitComputer.Add_SplitterMoved({ Update-ComputerNotesLayout })
 
+$cCompLaps = New-Card $splitComputer.Panel2 "LAPS (local admin)" 132
+New-Lbl $cCompLaps "Password" $F.Small $C.TextMuted 14 30 | Out-Null
+$txtLapsPwd = New-Txt $cCompLaps 88 26 200 $F.Mono
+$txtLapsPwd.UseSystemPasswordChar = $true
+$txtLapsPwd.Enabled = $false
+$btnLapsShow = New-Btn $cCompLaps "Show" $F.Small $C.Bg $C.TextPrimary 296 24 56 28 $false
+$btnLapsShow.FlatAppearance.BorderColor=$C.Border; $btnLapsShow.FlatAppearance.BorderSize=1
+$btnLapsCopy = New-Btn $cCompLaps "Copy" $F.Small $C.Bg $C.TextPrimary 358 24 56 28 $false
+$btnLapsCopy.FlatAppearance.BorderColor=$C.Border; $btnLapsCopy.FlatAppearance.BorderSize=1
+$lblLapsExp = New-Lbl $cCompLaps "LAPS password not loaded." $F.Small $C.TextMuted 14 62
+$lblLapsExp.Size = New-Object System.Drawing.Size(360, 32)
+
 $cCompAct = New-Card $splitComputer.Panel2 "Actions" 84
 $btnComputerRefresh = New-Btn $cCompAct "Refresh"      $F.Heading $C.Bg $C.TextPrimary 14 30 110 34 $false
 $btnComputerRefresh.FlatAppearance.BorderColor=$C.Border; $btnComputerRefresh.FlatAppearance.BorderSize=1
@@ -1330,30 +1700,69 @@ $btnComputerCopy.FlatAppearance.BorderColor=$C.Border; $btnComputerCopy.FlatAppe
 $pnlComputerTab.Controls.Add($pnlComputerSearch)
 
 # -- COMPUTER TAB LOGIC --------------------------------------------------------
-$script:CurComputer=$null; $script:CurComputerGroups=@(); $script:CurComputerIP=''
+$script:CurComputer=$null; $script:CurComputerGroups=@(); $script:CurComputerIP=''; $script:CurLapsPassword=$null
+
+function Set-LapsDisplay {
+    param($Laps)
+    $script:CurLapsPassword = $null
+    $txtLapsPwd.Text = ''
+    $txtLapsPwd.UseSystemPasswordChar = $true
+    $btnLapsShow.Text = 'Show'
+    $btnLapsShow.Enabled = $false
+    $btnLapsCopy.Enabled = $false
+    if (-not $Laps) {
+        $lblLapsExp.Text = 'LAPS password not loaded.'
+        $lblLapsExp.ForeColor = $C.TextMuted
+        return
+    }
+    if ($Laps.Available -and $Laps.Password) {
+        $script:CurLapsPassword = [string]$Laps.Password
+        $txtLapsPwd.Text = '********'
+        $btnLapsShow.Enabled = $true
+        $btnLapsCopy.Enabled = $true
+        $expText = if ($Laps.Expiration) { "Expires: $(Format-DateOrDash $Laps.Expiration)" } else { 'No expiration on file' }
+        $lblLapsExp.Text = "$($Laps.Source). $expText"
+        $lblLapsExp.ForeColor = $C.TextPrimary
+        return
+    }
+    $lblLapsExp.Text = if ($Laps.Message) { $Laps.Message } else { 'No LAPS password on this computer.' }
+    $lblLapsExp.ForeColor = $C.TextMuted
+}
 
 function Clear-CDisplay {
-    $lblCompName.Text="-"; $lblCompDns.Text="-"; $lblCompDesc.Text="-"; $lblCompLoc.Text="-"; $lblCompStat.Text=""
-    $vCompOU.Text="-"; $vCompIP.Text="-"; $vCompOS.Text="-"; $vCompOSVer.Text="-"; $vCompLogon.Text="-"
+    $lblCompName.Text="-"; $lblCompDns.Text="-"; $lblCompDesc.Text="-"; $lblCompLoc.Text="-"
+    $lblCompStale.Text="-"; $lblCompStat.Text=""
+    $vCompOU.Text="-"; $vCompIP.Text="-"; $vCompLoc.Text="-"; $vCompOS.Text="-"; $vCompOSVer.Text="-"; $vCompLogon.Text="-"
     $vCompPwdSet.Text="-"; $vCompCreated.Text="-"; $vCompChanged.Text="-"; $vCompManaged.Text="-"; $vCompDN.Text="-"
     $txtComputerNotes.Text=""; $txtComputerNotes.Enabled=$false
     $lstComputerGroups.Items.Clear()
     $btnComputerRefresh.Enabled=$false; $btnComputerCopy.Enabled=$false; $btnComputerSaveNotes.Enabled=$false
     $script:CurComputer=$null; $script:CurComputerGroups=@(); $script:CurComputerIP=''
+    Set-LapsDisplay -Laps $null
 }
 
 function Show-CData {
-    param($Computer, $Groups, [string]$IPAddress = '')
+    param($Computer, $Groups, [string]$IPAddress = '', $Laps = $null)
     $lblCompName.Text = $Computer.Name
     $lblCompDns.Text  = if($Computer.DNSHostName){$Computer.DNSHostName}else{"No DNS hostname on object"}
     $lblCompDesc.Text = if($Computer.Description){$Computer.Description}else{"No description on file"}
-    $lblCompLoc.Text  = if($Computer.Location){"Location: $($Computer.Location)"}else{"No location on file"}
+    $lblCompLoc.Text  = if($Computer.Location){"Location: $($Computer.Location)"}else{"No physical location on file"}
+    $activity = Get-ComputerActivityStatus -Computer $Computer -StaleDays $CONFIG.StaleComputerDays
+    $lblCompStale.Text = $activity.Text
+    $lblCompStale.ForeColor = if ($activity.IsStale) { $C.Warning } else { $C.TextMuted }
     if($Computer.Enabled){ $lblCompStat.Text="* ENABLED"; $lblCompStat.ForeColor=$C.Success }
     else                { $lblCompStat.Text="* DISABLED"; $lblCompStat.ForeColor=$C.Danger  }
 
     $vCompOU.Text      = Get-OUPathFromDN $Computer.DistinguishedName
     $vCompIP.Text      = if($IPAddress){$IPAddress}else{"Not found in DNS/AD"}
     $vCompIP.ForeColor = if($IPAddress){$C.TextPrimary}else{$C.Warning}
+    if ($Computer.Location) {
+        $vCompLoc.Text = [string]$Computer.Location
+        $vCompLoc.ForeColor = $C.TextPrimary
+    } else {
+        $vCompLoc.Text = "Not set in AD"
+        $vCompLoc.ForeColor = $C.TextMuted
+    }
     $vCompOS.Text      = if($Computer.OperatingSystem){$Computer.OperatingSystem}else{"-"}
     $vCompOSVer.Text   = if($Computer.OperatingSystemVersion){$Computer.OperatingSystemVersion}else{"-"}
     $vCompLogon.Text   = Format-DateOrNever $Computer.LastLogonDate
@@ -1371,6 +1780,7 @@ function Show-CData {
     $btnComputerRefresh.Enabled = $true
     $btnComputerCopy.Enabled = $true
     $btnComputerSaveNotes.Enabled = $true
+    Set-LapsDisplay -Laps $Laps
     Set-Status "Loaded computer: $($Computer.Name)  |  $($Groups.Count) group(s)" 'success'
 }
 
@@ -1383,7 +1793,11 @@ function Get-ComputerSummaryText {
         "IP: $script:CurComputerIP"
         "Enabled: $($c.Enabled)"
         "OU: $(Get-OUPathFromDN $c.DistinguishedName)"
+        "Physical Location: $(if($c.Location){$c.Location}else{'-'})"
+        "Activity: $( (Get-ComputerActivityStatus -Computer $c -StaleDays $CONFIG.StaleComputerDays).Text )"
+        "Description: $(if($c.Description){$c.Description}else{'-'})"
         "OS: $($c.OperatingSystem)"
+        "LAPS: $(if($script:CurLapsPassword){'(stored - use Show in app)'}elseif($lblLapsExp.Text){$lblLapsExp.Text}else{'-'})"
         "Last Logon: $(Format-DateOrNever $c.LastLogonDate)"
         "Password Last Set: $(Format-DateOrNever $c.PasswordLastSet)"
         "Managed By: $(if($c.ManagedBy){Get-NameFromDN $c.ManagedBy}else{'-'})"
@@ -1411,7 +1825,7 @@ function Invoke-CSearch {
     $script:CurComputer = $r.Computer
     $script:CurComputerGroups = $r.Groups
     $script:CurComputerIP = $r.IPAddress
-    Show-CData -Computer $r.Computer -Groups $r.Groups -IPAddress $r.IPAddress
+    Show-CData -Computer $r.Computer -Groups $r.Groups -IPAddress $r.IPAddress -Laps $r.Laps
     Write-TerminalLog ("Computer lookup complete: $($r.Groups.Count) group(s), total {0:N0} ms" -f $sw.ElapsedMilliseconds) 'ok'
 }
 
@@ -1438,6 +1852,24 @@ $btnComputerSaveNotes.Add_Click({
 $btnComputerCopy.Add_Click({
     $summary = Get-ComputerSummaryText
     if($summary){ [System.Windows.Forms.Clipboard]::SetText($summary); Set-Status "Computer summary copied to clipboard." "info" }
+})
+$btnLapsShow.Add_Click({
+    if(-not $script:CurLapsPassword){return}
+    if($txtLapsPwd.UseSystemPasswordChar){
+        $txtLapsPwd.UseSystemPasswordChar=$false
+        $txtLapsPwd.Text=$script:CurLapsPassword
+        $btnLapsShow.Text='Hide'
+    } else {
+        $txtLapsPwd.UseSystemPasswordChar=$true
+        $txtLapsPwd.Text='********'
+        $btnLapsShow.Text='Show'
+    }
+})
+$btnLapsCopy.Add_Click({
+    if($script:CurLapsPassword){
+        [System.Windows.Forms.Clipboard]::SetText($script:CurLapsPassword)
+        Set-Status "LAPS password copied to clipboard." "info"
+    }
 })
 
 # ==============================================================================

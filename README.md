@@ -57,7 +57,22 @@ The app opens even when the domain is unreachable (for example, off VPN). AD act
 
 The **Computer** tab helps helpdesk staff quickly verify an AD computer object. Search by computer name with or without the trailing `$`.
 
-It shows OU path, DNS hostname, IP address from AD/DNS, operating system, last logon, password last set, managed-by, description/location, and computer group memberships. Use **Copy Summary** to paste the key details into a ticket.
+It shows OU path, DNS hostname, IP address from AD/DNS, physical location (AD `Location` attribute), inactive/stale hint (configurable via `StaleComputerDays` in `config.json`), operating system, last logon, password last set, managed-by, description, computer group memberships, and **LAPS** local admin password (legacy or Windows LAPS, when your account has read rights). Use **Copy Summary** to paste the key details into a ticket.
+
+## User lookup
+
+The **User** tab accepts **samAccountName** or **email / UPN**. It shows contact fields (manager, office, phone), lockout-related counts and times, account expiration, last modified, password flags, **extension attributes** used for provisioning (labels in `config.json`; `extensionAttribute10` defaults to **Personal email**), groups, and AD notes. Use **Copy Summary** to paste into a ticket.
+
+Example `config.json` extension labels:
+
+```json
+"UserExtensionAttributes": {
+  "extensionAttribute10": "Personal email",
+  "extensionAttribute3": "Student ID"
+}
+```
+
+Restart ADTools after editing `config.json`.
 
 ## AD notes
 

@@ -1,0 +1,7 @@
+{
+  "_comment": "StaleComputerDays: days without logon before the computer is marked inactive. UserExtensionAttributes: labels for extensionAttribute1-15 shown on the User tab.",
+  "StaleComputerDays": 90,
+  "UserExtensionAttributes": {
+    "extensionAttribute10": "Personal email"
+  }
+}
