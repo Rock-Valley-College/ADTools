@@ -517,11 +517,100 @@ function Get-ComputerActivityStatus {
     return @{ Text = "Active ($days days since last logon)"; IsStale = $false }
 }
 
-function Get-ComputerLapsInfo {
+function Invoke-LoggedLaps {
     param(
-        [Parameter(Mandatory)][string]$ComputerName,
-        $Computer = $null
+        [scriptblock]$ScriptBlock,
+        [string]$CommandLabel
     )
+    Write-TerminalLog $CommandLabel 'cmd'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $out = & $ScriptBlock
+        $sw.Stop()
+        Write-TerminalLog ("finished in {0:N0} ms" -f $sw.ElapsedMilliseconds) 'ok'
+        return $out
+    } catch {
+        $sw.Stop()
+        Write-TerminalLog ("failed after {0:N0} ms: {1}" -f $sw.ElapsedMilliseconds, $_.Exception.Message) 'err'
+        throw
+    }
+}
+
+function Ensure-LapsCmdlet {
+    if ($null -ne $script:LapsCmdletReady) { return $script:LapsCmdletReady }
+    $script:LapsCmdletReady = $false
+    if (Get-Command Get-LapsADPassword -ErrorAction SilentlyContinue) {
+        $script:LapsCmdletReady = $true
+        return $true
+    }
+    foreach ($modName in @('LAPS', 'Laps')) {
+        if (-not (Get-Module -ListAvailable -Name $modName)) { continue }
+        try {
+            Import-Module $modName -ErrorAction Stop
+            if (Get-Command Get-LapsADPassword -ErrorAction SilentlyContinue) {
+                $script:LapsCmdletReady = $true
+                Write-TerminalLog "LAPS module loaded ($modName)" 'info'
+                return $true
+            }
+        } catch { }
+    }
+    return $false
+}
+
+function Initialize-LapsCapability {
+    if ($null -ne $script:LapsCapability) { return $script:LapsCapability }
+
+    $cap = @{ Cmdlet = $false; Legacy = $false; Windows = $false }
+    $cap.Cmdlet = Ensure-LapsCmdlet
+
+    if ($cap.Cmdlet) {
+        Write-TerminalLog 'LAPS: using Get-LapsADPassword (Windows LAPS PowerShell module).' 'info'
+    } else {
+        $ad = Test-ADConnectivity
+        if ($ad.Ready) {
+            foreach ($probe in @(
+                @{ Kind = 'Legacy';  Prop = 'ms-Mcs-AdmPwd' }
+                @{ Kind = 'Windows'; Prop = 'msLAPS-Password' }
+            )) {
+                try {
+                    $null = Get-ADComputer -Filter * -Properties $probe.Prop -ResultSetSize 1 -ErrorAction Stop
+                    $cap[$probe.Kind] = $true
+                } catch {
+                    if ($_.Exception.Message -notmatch 'invalid|One or more properties') {
+                        Write-TerminalLog "LAPS schema check ($($probe.Prop)): $($_.Exception.Message)" 'info'
+                    }
+                }
+            }
+            if ($cap.Legacy -or $cap.Windows) {
+                $kinds = @()
+                if ($cap.Legacy) { $kinds += 'legacy AD attributes' }
+                if ($cap.Windows) { $kinds += 'Windows LAPS attributes' }
+                Write-TerminalLog ("LAPS fallback: {0}" -f ($kinds -join ', ')) 'info'
+            } else {
+                Write-TerminalLog 'LAPS unavailable (install LAPS module on this PC, or no LAPS in AD).' 'info'
+            }
+        }
+    }
+
+    $script:LapsCapability = $cap
+    return $cap
+}
+
+function Get-LapsAdPropertyNames {
+    $cap = Initialize-LapsCapability
+    $props = @()
+    if ($cap.Legacy) {
+        $props += 'ms-Mcs-AdmPwd', 'ms-Mcs-AdmPwdExpirationTime'
+    }
+    if ($cap.Windows) {
+        $props += 'msLAPS-Password', 'msLAPS-PasswordExpirationTime',
+            'msLAPS-EncryptedPassword', 'msLAPS-EncryptedPasswordExpirationTime'
+    }
+    return $props
+}
+
+function Get-LapsPasswordViaCmdlet {
+    param([string]$ComputerName)
     $info = @{
         Available  = $false
         Password   = $null
@@ -529,27 +618,78 @@ function Get-ComputerLapsInfo {
         Source     = ''
         Message    = ''
     }
-    $lapsProps = @(
-        'msLAPS-Password', 'msLAPS-PasswordExpirationTime',
-        'msLAPS-EncryptedPassword', 'msLAPS-EncryptedPasswordExpirationTime',
-        'ms-Mcs-AdmPwd', 'ms-Mcs-AdmPwdExpirationTime'
-    )
-    $obj = $Computer
-    if (-not $obj) {
-        try {
-            $obj = Invoke-LoggedAd {
-                Get-ADComputer -Identity $ComputerName -Properties $lapsProps -ErrorAction Stop
-            } -CommandLabel "Get-ADComputer -Identity '$ComputerName' -Properties (LAPS)"
-        } catch {
-            $info.Message = "Could not read LAPS attributes: $($_.Exception.Message)"
+    if (-not (Ensure-LapsCmdlet)) { return $null }
+
+    $id = $ComputerName.Trim().TrimEnd('$')
+    try {
+        $result = Invoke-LoggedLaps {
+            Get-LapsADPassword -Identity $id -AsPlainText -ErrorAction Stop
+        } -CommandLabel "Get-LapsADPassword -Identity '$id' -AsPlainText"
+    } catch {
+        $msg = $_.Exception.Message
+        if ($msg -match 'cannot find|not found|does not exist|unable to find|no matching') {
+            $info.Message = 'No LAPS password on this computer.'
             return $info
         }
+        $info.Message = "Get-LapsADPassword failed: $msg"
+        return $info
     }
+
+    $row = @($result) | Select-Object -First 1
+    if (-not $row) {
+        $info.Message = 'No LAPS password returned for this computer.'
+        return $info
+    }
+    if ($row.DecryptionStatus -eq 'Unauthorized') {
+        $who = if ($row.AuthorizedDecryptor) { [string]$row.AuthorizedDecryptor } else { 'delegated LAPS readers' }
+        $info.Message = "LAPS password exists but access was denied. Authorized: $who"
+        return $info
+    }
+    $pwd = [string]$row.Password
+    if ([string]::IsNullOrWhiteSpace($pwd)) {
+        $info.Message = 'No LAPS password on this computer.'
+        return $info
+    }
+
+    $info.Available = $true
+    $info.Password = $pwd
+    $info.Source = if ($row.Source) { [string]$row.Source } else { 'Get-LapsADPassword' }
+    if ($row.ExpirationTimestamp) {
+        try { $info.Expiration = [datetime]$row.ExpirationTimestamp } catch { }
+    }
+    if ($row.Account) {
+        $info.Source = "$($info.Source) ($($row.Account))"
+    }
+    return $info
+}
+
+function Get-LapsPasswordViaAdAttributes {
+    param([string]$ComputerName)
+    $info = @{
+        Available  = $false
+        Password   = $null
+        Expiration = $null
+        Source     = ''
+        Message    = ''
+    }
+
+    $lapsProps = Get-LapsAdPropertyNames
+    if ($lapsProps.Count -eq 0) { return $null }
+
+    try {
+        $obj = Invoke-LoggedAd {
+            Get-ADComputer -Identity $ComputerName -Properties $lapsProps -ErrorAction Stop
+        } -CommandLabel "Get-ADComputer -Identity '$ComputerName' -Properties (LAPS)"
+    } catch {
+        $info.Message = "Could not read LAPS attributes: $($_.Exception.Message)"
+        return $info
+    }
+
     $winPwd = $obj.'msLAPS-Password'
     if ($winPwd) {
         $info.Available = $true
         $info.Password = [string]$winPwd
-        $info.Source = 'Windows LAPS'
+        $info.Source = 'Windows LAPS (AD attribute)'
         if ($obj.'msLAPS-PasswordExpirationTime') {
             try { $info.Expiration = [datetime]$obj.'msLAPS-PasswordExpirationTime' } catch { }
         }
@@ -559,40 +699,42 @@ function Get-ComputerLapsInfo {
     if ($legacyPwd) {
         $info.Available = $true
         $info.Password = [string]$legacyPwd
-        $info.Source = 'Legacy LAPS'
+        $info.Source = 'Legacy LAPS (AD attribute)'
         if ($obj.'ms-Mcs-AdmPwdExpirationTime') {
             try { $info.Expiration = [datetime]::FromFileTime([Int64]$obj.'ms-Mcs-AdmPwdExpirationTime') } catch { }
         }
         return $info
     }
     if ($obj.'msLAPS-EncryptedPassword') {
-        if (Get-Command Get-LapsADPassword -ErrorAction SilentlyContinue) {
-            try {
-                $plain = $null
-                try {
-                    $plain = Get-LapsADPassword -Identity $ComputerName -AsPlainText -ErrorAction Stop
-                } catch {
-                    $plain = Get-LapsADPassword -ComputerName $ComputerName -AsPlainText -ErrorAction Stop
-                }
-                if ($plain) {
-                    $info.Available = $true
-                    $info.Password = [string]$plain
-                    $info.Source = 'Windows LAPS (encrypted)'
-                    if ($obj.'msLAPS-EncryptedPasswordExpirationTime') {
-                        try { $info.Expiration = [datetime]$obj.'msLAPS-EncryptedPasswordExpirationTime' } catch { }
-                    }
-                    return $info
-                }
-            } catch {
-                $info.Message = "Encrypted LAPS password present; read failed: $($_.Exception.Message)"
-                return $info
-            }
-        }
-        $info.Message = 'Encrypted LAPS password (requires Get-LapsADPassword / LAPS read rights).'
+        $info.Message = 'Encrypted LAPS password in AD; install the LAPS PowerShell module and use Get-LapsADPassword.'
         return $info
     }
     $info.Message = 'No LAPS password stored on this computer.'
     return $info
+}
+
+function Get-ComputerLapsInfo {
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        $Computer = $null
+    )
+
+    $cap = Initialize-LapsCapability
+    if ($cap.Cmdlet) {
+        $viaCmdlet = Get-LapsPasswordViaCmdlet -ComputerName $ComputerName
+        if ($null -ne $viaCmdlet) { return $viaCmdlet }
+    }
+
+    $viaAttrs = Get-LapsPasswordViaAdAttributes -ComputerName $ComputerName
+    if ($null -ne $viaAttrs) { return $viaAttrs }
+
+    return @{
+        Available  = $false
+        Password   = $null
+        Expiration = $null
+        Source     = ''
+        Message    = 'LAPS is not available (install the LAPS PowerShell module on this PC, or LAPS is not used in this domain).'
+    }
 }
 
 function Test-ComputerAccountName {

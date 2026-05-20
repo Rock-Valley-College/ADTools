@@ -57,7 +57,7 @@ The app opens even when the domain is unreachable (for example, off VPN). AD act
 
 The **Computer** tab helps helpdesk staff quickly verify an AD computer object. Search by computer name with or without the trailing `$`.
 
-It shows OU path, DNS hostname, IP address from AD/DNS, physical location (AD `Location` attribute), inactive/stale hint (configurable via `StaleComputerDays` in `config.json`), operating system, last logon, password last set, managed-by, description, computer group memberships, and **LAPS** local admin password (legacy or Windows LAPS, when your account has read rights). Use **Copy Summary** to paste the key details into a ticket.
+It shows OU path, DNS hostname, IP address from AD/DNS, physical location (AD `Location` attribute), inactive/stale hint (configurable via `StaleComputerDays` in `config.json`), operating system, last logon, password last set, managed-by, description, computer group memberships, and **LAPS** local admin password via `Get-LapsADPassword` when the Windows **LAPS** PowerShell module is installed (falls back to legacy AD attributes if not). Use **Copy Summary** to paste the key details into a ticket.
 
 ## User lookup
 
