@@ -1,0 +1,12 @@
+﻿----- 2026-05-19 21:15:36 -----
+ADTools could not start.
+System.ArgumentException: Argument types do not match
+   at System.Linq.Expressions.Expression.Condition(Expression test, Expression ifTrue, Expression ifFalse)
+   at System.Management.Automation.Language.PSEnumerableBinder.MaybeDebase(DynamicMetaObjectBinder binder, Func`2 generator, DynamicMetaObject target)
+   at System.Management.Automation.Language.PSToObjectArrayBinder.Bind(DynamicMetaObject target, DynamicMetaObject[] args)
+   at System.Dynamic.DynamicMetaObjectBinder.Bind(Object[] args, ReadOnlyCollection`1 parameters, LabelTarget returnLabel)
+   at System.Runtime.CompilerServices.CallSiteBinder.BindCore[T](CallSite`1 site, Object[] args)
+   at System.Dynamic.UpdateDelegates.UpdateAndExecute1[T0,TRet](CallSite site, T0 arg0)
+   at System.Management.Automation.Interpreter.DynamicInstruction`2.Run(InterpretedFrame frame)
+   at System.Management.Automation.Interpreter.EnterTryCatchFinallyInstruction.Run(InterpretedFrame frame)
+

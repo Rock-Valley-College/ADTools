@@ -636,8 +636,14 @@ function Get-ExtensionAttributePropertyNames {
     return 1..15 | ForEach-Object { "extensionAttribute$_" }
 }
 
+function Get-ExtensionAttributeSortOrder {
+    param([string]$Name)
+    if ($Name -match '^extensionAttribute(\d+)$') { return [int]$Matches[1] }
+    return 999
+}
+
 function Get-UserExtensionAttributeDefinitions {
-    $defs = New-Object System.Collections.Generic.List[object]
+    $defs = @()
     $raw = $CONFIG['UserExtensionAttributes']
     if ($raw) {
         $pairs = @()
@@ -648,18 +654,16 @@ function Get-UserExtensionAttributeDefinitions {
                 $pairs += [pscustomobject]@{ Name = [string]$p.Name; Label = [string]$p.Value }
             }
         }
-        foreach ($pair in ($pairs | Sort-Object {
-            if ($_.Name -match '^extensionAttribute(\d+)$') { [int]$Matches[1] } else { 999 }
-        })) {
+        foreach ($pair in ($pairs | Sort-Object { Get-ExtensionAttributeSortOrder $_.Name })) {
             if ($pair.Name -match '^extensionAttribute(\d+)$') {
-                [void]$defs.Add([pscustomobject]@{ Attribute = $pair.Name; Label = $pair.Label })
+                $defs += [pscustomobject]@{ Attribute = $pair.Name; Label = $pair.Label }
             }
         }
     }
     if ($defs.Count -eq 0) {
-        [void]$defs.Add([pscustomobject]@{ Attribute = 'extensionAttribute10'; Label = 'Personal email' })
+        $defs += [pscustomobject]@{ Attribute = 'extensionAttribute10'; Label = 'Personal email' }
     }
-    return @($defs)
+    return $defs
 }
 
 function Get-ExtensionAttributeValue {
@@ -981,6 +985,9 @@ $C = @{
     LogSuccess  = [System.Drawing.Color]::FromArgb(0, 110, 55)
     LogMuted    = [System.Drawing.Color]::FromArgb(100, 100, 100)
     LogAccent   = [System.Drawing.Color]::FromArgb(0, 90, 180)
+    BtnDisabledBg     = [System.Drawing.Color]::FromArgb(225, 225, 225)
+    BtnDisabledFg     = [System.Drawing.Color]::FromArgb(150, 150, 150)
+    BtnDisabledBorder = [System.Drawing.Color]::FromArgb(210, 210, 210)
 }
 $F = @{
     Title   = New-Object System.Drawing.Font("Segoe UI",13,[System.Drawing.FontStyle]::Bold)
@@ -1003,6 +1010,51 @@ function Set-ControlDarkStyle {
         if ($styleProp) { $styleProp.SetValue($Control, $false, $null) }
         if ($BackColor -ne [System.Drawing.Color]::Empty) { $Control.BackColor = $BackColor }
     } catch { }
+}
+
+$script:StyledButtons = New-Object System.Collections.Generic.List[System.Windows.Forms.Button]
+
+function Sync-ButtonDisabledAppearance {
+    param([System.Windows.Forms.Button]$Button)
+    $tag = $Button.Tag
+    if (-not ($tag -is [hashtable]) -or -not $tag.ContainsKey('EnabledBack')) { return }
+    if ($Button.Enabled) {
+        $Button.BackColor = $tag.EnabledBack
+        $Button.ForeColor = $tag.EnabledFore
+        $Button.Cursor = [System.Windows.Forms.Cursors]::Hand
+        if ($Button.FlatAppearance.BorderSize -gt 0) {
+            if (-not $tag.EnabledBorderColor) {
+                $tag.EnabledBorderColor = $Button.FlatAppearance.BorderColor
+            }
+            $Button.FlatAppearance.BorderColor = $tag.EnabledBorderColor
+        }
+    } else {
+        $Button.BackColor = $C.BtnDisabledBg
+        $Button.ForeColor = $C.BtnDisabledFg
+        $Button.Cursor = [System.Windows.Forms.Cursors]::Default
+        if ($Button.FlatAppearance.BorderSize -gt 0) {
+            if (-not $tag.EnabledBorderColor) {
+                $tag.EnabledBorderColor = $Button.FlatAppearance.BorderColor
+            }
+            $Button.FlatAppearance.BorderColor = $C.BtnDisabledBorder
+        }
+    }
+}
+
+function Register-ButtonDisabledStyle {
+    param([System.Windows.Forms.Button]$Button)
+    $Button.Tag = @{
+        EnabledBack = $Button.BackColor
+        EnabledFore = $Button.ForeColor
+    }
+    $Button.Add_EnabledChanged({
+        param($sender, $e)
+        Sync-ButtonDisabledAppearance -Button $sender
+    })
+    if (-not $script:StyledButtons.Contains($Button)) {
+        [void]$script:StyledButtons.Add($Button)
+    }
+    Sync-ButtonDisabledAppearance -Button $Button
 }
 
 function Set-TabNavStyle {
@@ -1205,7 +1257,9 @@ function New-Btn { param($parent,$text,$font,$bg,$fg,$x,$y,$w,$h,[bool]$enabled=
     $b.FlatAppearance.BorderSize=0; $b.Cursor="Hand"; $b.Enabled=$enabled
     Set-ControlDarkStyle $b
     $b.ForeColor=$fg
-    $parent.Controls.Add($b); return $b }
+    $parent.Controls.Add($b)
+    Register-ButtonDisabledStyle -Button $b
+    return $b }
 function New-Txt { param($parent,$x,$y,$w,$font)
     $t=New-Object System.Windows.Forms.TextBox; $t.Size=New-Object System.Drawing.Size($w,26)
     $t.Location=New-Object System.Drawing.Point($x,$y); $t.BackColor=$C.InputBg
@@ -1273,7 +1327,7 @@ $vFullDN  = New-DR $cDet "Full DN"            402
 $vFullDN.Size = New-Object System.Drawing.Size(220,48)
 
 $script:UserExtAttrFields = @()
-$extDefs = Get-UserExtensionAttributeDefinitions
+$extDefs = @(Get-UserExtensionAttributeDefinitions)
 $extCardHeight = [Math]::Max(58, 28 + ($extDefs.Count * 22) + 14)
 $cExt = New-Card $splitUser.Panel1 "Provisioning (extension attributes)" $extCardHeight
 $extY = 28
@@ -1329,6 +1383,23 @@ $pnlUserTab.Controls.Add($pnlUserSearch)
 # -- USER TAB LOGIC ------------------------------------------------------------
 $script:CurUser=$null; $script:CurGroups=@(); $script:CurPasswordStatus=$null
 
+function Set-UserActionButtons {
+    param($User = $null)
+    $loaded = ($null -ne $User)
+    $btnRefresh.Enabled = $loaded
+    $btnUserSaveNotes.Enabled = $loaded
+    $btnUserCopy.Enabled = $loaded
+    $btnUnlock.Enabled = ($loaded -and $User.LockedOut)
+    $btnEnable.Enabled = ($loaded -and -not $User.Enabled)
+    if ($loaded -and $User.LockedOut) {
+        $btnDiag.Visible = $true
+        $btnDiag.Enabled = $true
+    } else {
+        $btnDiag.Visible = $false
+        $btnDiag.Enabled = $false
+    }
+}
+
 function Clear-UDisplay {
     $lblDN.Text="-"; $lblUN2.Text="-"; $lblUPN.Text="-"; $lblMail.Text="-"; $lblDept.Text="-"
     $lblStat.Text=""; $lblLock.Text=""
@@ -1337,10 +1408,9 @@ function Clear-UDisplay {
     $vModified.Text="-"; $vAcctExp.Text="-"; $vBadPwd.Text="-"; $vLastBad.Text="-"; $vLockTime.Text="-"
     $vManager.Text="-"; $vOffice.Text="-"; $vPhone.Text="-"; $vOU.Text="-"; $vFullDN.Text="-"
     $lstGroups.Items.Clear(); $txtUserNotes.Text=""; $txtUserNotes.Enabled=$false
-    $btnUnlock.Enabled=$false; $btnEnable.Enabled=$false; $btnRefresh.Enabled=$false
-    $btnUserSaveNotes.Enabled=$false; $btnUserCopy.Enabled=$false; $btnDiag.Visible=$false
     foreach ($extField in $script:UserExtAttrFields) { $extField.ValueLabel.Text = '-' }
     $script:CurUser=$null; $script:CurGroups=@(); $script:CurPasswordStatus=$null
+    Set-UserActionButtons
 }
 
 function Set-UserExtensionFields {
@@ -1421,11 +1491,9 @@ function Show-UData {
     $lblMail.Text= if($User.EmailAddress){$User.EmailAddress}else{"No email on file"}
     $dp=@(); if($User.Title){$dp+=$User.Title}; if($User.Department){$dp+=$User.Department}
     $lblDept.Text= if($dp){$dp -join "  |  "}else{"No dept/title on file"}
-    if($User.Enabled){ $lblStat.Text="* ACTIVE";    $lblStat.ForeColor=$C.Success; $btnEnable.Enabled=$false }
-    else             { $lblStat.Text="* DISABLED";  $lblStat.ForeColor=$C.Danger;  $btnEnable.Enabled=$true  }
-    if($User.LockedOut){
-        $lblLock.Text="LOCKED OUT"; $btnUnlock.Enabled=$true; $btnDiag.Visible=$true
-    } else { $lblLock.Text=""; $btnUnlock.Enabled=$false; $btnDiag.Visible=$false }
+    if($User.Enabled){ $lblStat.Text="* ACTIVE";    $lblStat.ForeColor=$C.Success }
+    else             { $lblStat.Text="* DISABLED";  $lblStat.ForeColor=$C.Danger  }
+    if($User.LockedOut){ $lblLock.Text="LOCKED OUT" } else { $lblLock.Text="" }
     $vCreated.Text= Format-DateOrNever $User.Created
     $vLogon.Text  = Format-DateOrNever $User.LastLogonDate
     $vPwdSet.Text = Format-DateOrNever $User.PasswordLastSet
@@ -1509,9 +1577,7 @@ function Show-UData {
     else { $lstGroups.Items.Add("(no group memberships)")|Out-Null }
     $txtUserNotes.Text = if($User.info){[string]$User.info}else{""}
     $txtUserNotes.Enabled = $true
-    $btnRefresh.Enabled = $true
-    $btnUserSaveNotes.Enabled = $true
-    $btnUserCopy.Enabled = $true
+    Set-UserActionButtons -User $User
     if ($PasswordStatus -and $PasswordStatus.Issues.Count -gt 0) {
         $hint = $PasswordStatus.Issues[0]
         if ($PasswordStatus.Issues.Count -gt 1) { $hint += " (+$($PasswordStatus.Issues.Count - 1) more - see terminal)" }
@@ -1577,9 +1643,11 @@ $btnUnlock.Add_Click({
     $btnUnlock.Enabled=$false; Set-Status "Unlocking $u..." "info"
     $r=Invoke-AccountUnlock -Username $u
     if($r.Success){
+        try { $script:CurUser.LockedOut = $false } catch { }
+        $lblLock.Text=""
         Set-Status "Account unlocked for $($script:CurUser.DisplayName)." "success"
-        $lblLock.Text=""; $btnDiag.Visible=$false
-    } else { Set-Status $r.Error "error"; $btnUnlock.Enabled=$true }
+        Set-UserActionButtons -User $script:CurUser
+    } else { Set-Status $r.Error "error"; Set-UserActionButtons -User $script:CurUser }
 })
 
 $btnEnable.Add_Click({
@@ -1594,7 +1662,8 @@ $btnEnable.Add_Click({
         $script:CurUser.Enabled=$true
         $lblStat.Text="* ACTIVE"; $lblStat.ForeColor=$C.Success
         Set-Status "Account enabled for $($script:CurUser.DisplayName)." "success"
-    } else { Set-Status $r.Error "error"; $btnEnable.Enabled=$true }
+        Set-UserActionButtons -User $script:CurUser
+    } else { Set-Status $r.Error "error"; Set-UserActionButtons -User $script:CurUser }
 })
 
 # Diagnose button - prefill lockout tab and switch to it
@@ -1602,6 +1671,7 @@ $btnDiag.Add_Click({
     if($script:CurUser){ $txtLockoutUser.Text=$script:CurUser.SamAccountName; Switch-AppTab -Name Lockout }
 })
 $btnUserCopy.Add_Click({
+    if(-not $script:CurUser){return}
     $summary = Get-UserSummaryText
     if($summary){ [System.Windows.Forms.Clipboard]::SetText($summary); Set-Status "User summary copied to clipboard." "info" }
 })
@@ -1702,6 +1772,13 @@ $pnlComputerTab.Controls.Add($pnlComputerSearch)
 # -- COMPUTER TAB LOGIC --------------------------------------------------------
 $script:CurComputer=$null; $script:CurComputerGroups=@(); $script:CurComputerIP=''; $script:CurLapsPassword=$null
 
+function Set-ComputerActionButtons {
+    param([bool]$Loaded = $false)
+    $btnComputerRefresh.Enabled = $Loaded
+    $btnComputerCopy.Enabled = $Loaded
+    $btnComputerSaveNotes.Enabled = $Loaded
+}
+
 function Set-LapsDisplay {
     param($Laps)
     $script:CurLapsPassword = $null
@@ -1736,8 +1813,8 @@ function Clear-CDisplay {
     $vCompPwdSet.Text="-"; $vCompCreated.Text="-"; $vCompChanged.Text="-"; $vCompManaged.Text="-"; $vCompDN.Text="-"
     $txtComputerNotes.Text=""; $txtComputerNotes.Enabled=$false
     $lstComputerGroups.Items.Clear()
-    $btnComputerRefresh.Enabled=$false; $btnComputerCopy.Enabled=$false; $btnComputerSaveNotes.Enabled=$false
     $script:CurComputer=$null; $script:CurComputerGroups=@(); $script:CurComputerIP=''
+    Set-ComputerActionButtons -Loaded $false
     Set-LapsDisplay -Laps $null
 }
 
@@ -1777,9 +1854,7 @@ function Show-CData {
     $lstComputerGroups.Items.Clear()
     if($Groups.Count -gt 0){ foreach($g in $Groups){ $lstComputerGroups.Items.Add($g)|Out-Null } }
     else { $lstComputerGroups.Items.Add("(no computer group memberships)")|Out-Null }
-    $btnComputerRefresh.Enabled = $true
-    $btnComputerCopy.Enabled = $true
-    $btnComputerSaveNotes.Enabled = $true
+    Set-ComputerActionButtons -Loaded $true
     Set-LapsDisplay -Laps $Laps
     Set-Status "Loaded computer: $($Computer.Name)  |  $($Groups.Count) group(s)" 'success'
 }
@@ -1850,6 +1925,7 @@ $btnComputerSaveNotes.Add_Click({
     }
 })
 $btnComputerCopy.Add_Click({
+    if(-not $script:CurComputer){return}
     $summary = Get-ComputerSummaryText
     if($summary){ [System.Windows.Forms.Clipboard]::SetText($summary); Set-Status "Computer summary copied to clipboard." "info" }
 })
@@ -1996,6 +2072,11 @@ $form.Add_Shown({
         Update-UserNotesLayout
         Update-ComputerGroupsListHeight
         Update-ComputerNotesLayout
+        Clear-UDisplay
+        Clear-CDisplay
+        foreach ($styledBtn in $script:StyledButtons) {
+            Sync-ButtonDisabledAppearance -Button $styledBtn
+        }
         $txtUserSearch.Focus()
         $ad = Ensure-ADModule
         if (-not $ad.Ready) {
